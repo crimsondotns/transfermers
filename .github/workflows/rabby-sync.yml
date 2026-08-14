@@ -34,12 +34,17 @@ jobs:
           GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME || 'Sheet1' }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
 
-          # Rate limit tuning (optional)
-          JITTER_MIN_MS: '2000'
-          JITTER_MAX_MS: '5000'
-          RATE_LIMIT_WAIT_MS: '60000'
-          MAX_RETRIES: '10'
-          MAX_429_RETRIES: '3'
-          MAX_TIMEOUT_RETRIES: '5'
-          CHUNK_SIZE: '500'
+          # Logging: INFO (default) or DEBUG for verbose per-request logs
+          LOG_LEVEL: 'INFO'
+
+          # Rate limit tuning (optional — adaptive defaults are sensible)
+          JITTER_MIN_MS: '3000'        # min spacing between requests
+          JITTER_MAX_MS: '6000'        # max spacing between requests
+          MAX_DELAY_MS: '20000'        # ceiling for adaptive request spacing
+          RATE_LIMIT_WAIT_MS: '60000'  # base cooldown on 429/403 (no Retry-After)
+          MAX_COOLDOWN_MS: '300000'    # hard cap on a single cooldown (5 min)
+          MAX_RETRIES: '10'            # max attempts per wallet
+          MAX_BLOCK_RETRIES: '4'       # max 429/403 cooldowns before giving up a wallet
+          MAX_TIMEOUT_RETRIES: '5'     # max retries on network timeout
+          CHUNK_SIZE: '500'            # rows per Google Sheets write
         run: node src/index.js
