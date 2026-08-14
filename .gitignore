@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
-package-lock.json
+# NOTE: package-lock.json is intentionally committed so that
+# GitHub Actions' npm cache and `npm ci` work reliably.
 pnpm-lock.yaml
 
 # Environment variables
