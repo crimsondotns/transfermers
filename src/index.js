@@ -1110,7 +1110,41 @@ async function findSheetProps(sheets, sheetName) {
 async function ensureSheetTab(sheets, sheetName) {
   const existing = await withRetry(
     () => findSheetProps(sheets, sheetName), `Look up tab "${sheetName}"`);
-  if (existing) return existing;
+
+  if (existing) {
+    // Tabs created before wallet_address existed have only 35 columns, and a
+    // 36-wide write into them fails with "exceeds grid limits". Widen the grid
+    // and refresh the header so no manual spreadsheet edit is ever needed.
+    const cols = existing.gridProperties?.columnCount || 0;
+    if (cols < SHEET_HEADER.length) {
+      log('INFO', `Widening "${sheetName}" from ${cols} to ${SHEET_HEADER.length} columns`);
+      await withRetry(() => sheets.spreadsheets.batchUpdate({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        resource: {
+          requests: [{
+            updateSheetProperties: {
+              properties: {
+                sheetId: existing.sheetId,
+                gridProperties: { columnCount: SHEET_HEADER.length },
+              },
+              fields: 'gridProperties.columnCount',
+            },
+          }],
+        },
+      }), `Widen tab "${sheetName}"`);
+
+      await withRetry(() => sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: `${sheetName}!A1`,
+        valueInputOption: 'RAW',
+        resource: { values: [SHEET_HEADER] },
+      }), `Write header row in "${sheetName}"`);
+      log('OK', `"${sheetName}" migrated — wallet_address header added automatically`);
+
+      existing.gridProperties.columnCount = SHEET_HEADER.length;
+    }
+    return existing;
+  }
 
   log('INFO', `Tab "${sheetName}" not found — creating it`);
   try {

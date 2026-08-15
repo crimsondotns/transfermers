@@ -324,9 +324,11 @@ cleared the tab and destroyed the rows of every wallet it didn't reach.
 A wallet that succeeds with **zero** in-window transactions correctly ends up with
 no rows — that is a real result, not a gap.
 
-> ⚠️ Existing tabs need the `wallet_address` header added in column **AJ**. Rows
-> written before it existed cannot be attributed and are dropped once, then
-> repopulate as their wallets are refreshed. New batch tabs get it automatically.
+> Tabs created before `wallet_address` existed are migrated **automatically**: the
+> grid is widened to 36 columns and the header row is rewritten on first write.
+> No manual spreadsheet edit is needed. Rows written before the column existed
+> cannot be attributed and are dropped once, then repopulate as their wallets are
+> refreshed.
 
 ### Google Sheets write quota
 
