@@ -1,0 +1,97 @@
+name: Rabby Transaction Sync
+
+on:
+  schedule:
+    # Full history for 200+ wallets is expensive — run it a few times a day, not
+    # every 15 minutes. Every 6 hours is a sensible starting point.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      batches:
+        description: 'How many batches to split the wallet list into'
+        required: false
+        default: '10'
+
+env:
+  # Number of matrix slices. MUST match the length of the matrix.batch list below —
+  # the script splits the wallet list into exactly this many contiguous slices.
+  BATCH_TOTAL: '10'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Per-job cap. The script enforces its own 20-minute guard well below this and
+    # flushes partial results, so a job should never actually be cancelled here.
+    timeout-minutes: 30
+
+    strategy:
+      # One blocked batch must not cancel the others — each writes its own tab.
+      fail-fast: false
+      # Rabby sees all of these at once, so keep the concurrency low and polite.
+      max-parallel: 3
+      matrix:
+        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    name: batch ${{ matrix.batch }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run transaction sync (batch ${{ matrix.batch }})
+        env:
+          # --- Wallets: one secret holds all 200+, the script slices this batch out ---
+          WALLET_LIST: ${{ secrets.WALLET_LIST }}
+
+          # --- Google Sheets ---
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME || 'Sheet1' }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          # Each batch writes only its own tab (Batch_01 … Batch_10), so parallel
+          # runners never clear or overwrite each other's rows.
+          BATCH_SHEET_PREFIX: 'Batch_'
+          SHEETS_WRITE_DELAY_MS: '1500'  # shared ~60 writes/min quota across runners
+
+          # --- History depth ---
+          PAGE_COUNT: '2000'             # full history window per wallet
+
+          LOG_LEVEL: 'INFO'
+
+          # --- Global safety guard: must stay well below timeout-minutes above ---
+          GLOBAL_TIMEOUT_MS: '1200000'   # stop fetching after 20 min
+          WRITE_RESERVE_MS: '90000'      # keep 90s to flush results to Sheets
+
+          # --- Request spacing (adaptive) ---
+          JITTER_MIN_MS: '3000'
+          JITTER_MAX_MS: '6000'
+          MAX_DELAY_MS: '20000'
+
+          # --- Pending-job polling: progressive backoff 20s -> 60s ---
+          PENDING_BASE_MS: '20000'
+          PENDING_STEP_MS: '10000'
+          PENDING_MAX_MS: '60000'
+          MAX_PENDING_ROUNDS: '4'
+
+          # --- 429/403 fail-fast ---
+          RATE_LIMIT_WAIT_MS: '60000'
+          MAX_COOLDOWN_MS: '120000'
+          MAX_BLOCK_RETRIES: '2'
+          WALLET_BLOCK_BUDGET_MS: '120000'
+          CIRCUIT_BREAKER_THRESHOLD: '2'
+
+          # --- Other budgets ---
+          MAX_RETRIES: '10'
+          MAX_TIMEOUT_RETRIES: '5'
+          CHUNK_SIZE: '500'
+          MIN_SUCCESS_RATIO: '0.5'
+        run: |
+          node src/index.js --batch ${{ matrix.batch }}/${{ github.event.inputs.batches || env.BATCH_TOTAL }}

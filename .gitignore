@@ -40,7 +40,7 @@ coverage/
 
 # Temporary files
 *.tmp
-.bot.lock
+.bot*.lock
 state.json.backup
 
 # Google credentials (NEVER commit!)

@@ -15,17 +15,171 @@ const GOOGLE_SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
 const GOOGLE_SHEET_NAME = process.env.GOOGLE_SHEET_NAME || 'Sheet1';
 const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS || '{}';
 
-// Wallet list: supports both env var and file
-const getWalletList = () => {
-  if (process.env.WALLET_LIST) {
-    return process.env.WALLET_LIST.split(',')
-      .map(w => w.trim().toLowerCase())
-      .filter(Boolean);
-  }
-  return [];
-};
-
 const num = (envVar, fallback) => parseInt(process.env[envVar] || String(fallback), 10);
+
+// ---------------------------------------------------------------------------
+// CLI arguments
+// ---------------------------------------------------------------------------
+//   node src/index.js                        full sync into the default tab
+//   node src/index.js --batch 3/10           batch 3 of 10 -> tab "Batch_03"
+//   node src/index.js --sheet Batch_03       explicit target tab
+//   node src/index.js 0xabc...               manual retry for one wallet
+//   node src/index.js --help
+function parseArgs(argv) {
+  const out = { wallet: null, sheet: null, batchIndex: null, batchTotal: null, help: false };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const takeValue = () => {
+      const inline = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : null;
+      return inline !== null ? inline : argv[++i];
+    };
+
+    if (arg === '--help' || arg === '-h') {
+      out.help = true;
+    } else if (arg === '--sheet' || arg.startsWith('--sheet=')) {
+      out.sheet = takeValue();
+    } else if (arg === '--wallet' || arg.startsWith('--wallet=')) {
+      out.wallet = takeValue();
+    } else if (arg === '--batch' || arg.startsWith('--batch=')) {
+      // Accepts "3/10" (index/total) or a bare "3" (total comes from BATCH_TOTAL).
+      const raw = String(takeValue() || '');
+      const [idx, total] = raw.split('/');
+      out.batchIndex = parseInt(idx, 10);
+      if (total !== undefined) out.batchTotal = parseInt(total, 10);
+      if (!Number.isInteger(out.batchIndex)) {
+        throw new Error(`Invalid --batch value "${raw}" (expected "N" or "N/TOTAL")`);
+      }
+    } else if (arg.startsWith('0x')) {
+      out.wallet = arg; // positional wallet address (manual retry mode)
+    } else if (arg.startsWith('-')) {
+      throw new Error(`Unknown option "${arg}" (try --help)`);
+    }
+  }
+  return out;
+}
+
+const CLI = parseArgs(process.argv.slice(2));
+
+const HELP_TEXT = `
+Rabby transaction sync — fetches wallet history and writes it to Google Sheets.
+
+Usage:
+  node src/index.js [options]
+  node src/index.js <0xWalletAddress>          Manual retry for one wallet (append only)
+
+Options:
+  --batch N/TOTAL     Process only batch N of TOTAL. The wallet list is split into
+                      TOTAL contiguous slices; this run handles slice N (1-based).
+                      Unless --sheet is given, the target tab becomes "<prefix>NN"
+                      (default prefix "Batch_", e.g. Batch_03).
+  --sheet NAME        Target sheet tab. Overrides the batch-derived name.
+  --wallet 0x...      Same as passing the address positionally.
+  -h, --help          Show this help.
+
+Key environment variables:
+  WALLET_LIST              Comma-separated wallet addresses (or use WALLETS_FILE)
+  WALLETS_FILE             Path to a JSON file: ["0x..."] or { "wallets": ["0x..."] }
+  GOOGLE_SPREADSHEET_ID    Target spreadsheet
+  GOOGLE_SHEET_NAME        Default tab when no batch/--sheet is given (default: Sheet1)
+  GOOGLE_CREDENTIALS       Service-account JSON
+  TARGET_SHEET_NAME        Same as --sheet (CLI wins)
+  BATCH_INDEX/BATCH_TOTAL  Same as --batch (CLI wins)
+  BATCH_SHEET_PREFIX       Prefix for batch tabs (default: Batch_)
+  PAGE_COUNT               History depth per wallet (default: 2000)
+
+See config/example.env for the full list, including the rate-limit and
+safety-timeout settings.
+`;
+
+// ---------------------------------------------------------------------------
+// Wallet list + batch slicing
+// ---------------------------------------------------------------------------
+// With 200+ wallets a single run cannot finish inside the workflow timeout, so
+// the list is split into contiguous batches and each GitHub Actions matrix job
+// handles one slice, writing to its own sheet tab. Slicing is deterministic:
+// the same BATCH_INDEX always maps to the same wallets.
+
+/** Read every configured wallet, from WALLET_LIST or WALLETS_FILE. */
+function loadAllWallets() {
+  const raw = [];
+
+  if (process.env.WALLET_LIST) {
+    raw.push(...process.env.WALLET_LIST.split(','));
+  } else if (process.env.WALLETS_FILE) {
+    const file = path.resolve(process.env.WALLETS_FILE);
+    if (!fs.existsSync(file)) throw new Error(`WALLETS_FILE not found: ${file}`);
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const list = Array.isArray(parsed) ? parsed : parsed.wallets;
+    if (!Array.isArray(list)) {
+      throw new Error(`${file} must contain an array, or an object with a "wallets" array`);
+    }
+    raw.push(...list);
+  }
+
+  // Normalise and de-duplicate while preserving order, so batch boundaries are stable.
+  const seen = new Set();
+  const wallets = [];
+  for (const entry of raw) {
+    const addr = String(entry).trim().toLowerCase();
+    if (addr && !seen.has(addr)) {
+      seen.add(addr);
+      wallets.push(addr);
+    }
+  }
+  return wallets;
+}
+
+/** Resolve the active batch from CLI flags or env vars (CLI wins). */
+function resolveBatch() {
+  const index = CLI.batchIndex ?? (process.env.BATCH_INDEX ? num('BATCH_INDEX', 0) : null);
+  const total = CLI.batchTotal ?? (process.env.BATCH_TOTAL ? num('BATCH_TOTAL', 0) : null);
+  if (index == null) return null; // batching disabled — process every wallet
+
+  if (!Number.isInteger(total) || total < 1) {
+    throw new Error(`Batch index ${index} given without a valid total (use --batch N/TOTAL or BATCH_TOTAL)`);
+  }
+  if (!Number.isInteger(index) || index < 1 || index > total) {
+    throw new Error(`Batch index ${index} is out of range 1..${total}`);
+  }
+  return { index, total };
+}
+
+/**
+ * Split `items` into `total` contiguous slices and return slice `index` (1-based).
+ * Remainders are spread over the first slices, so 200 wallets across 10 batches
+ * gives 20 each, and 205 gives 21,21,21,21,21,20,20,20,20,20 — never an empty batch.
+ */
+function sliceForBatch(items, index, total) {
+  const base = Math.floor(items.length / total);
+  const remainder = items.length % total;
+  const start = (index - 1) * base + Math.min(index - 1, remainder);
+  const size = base + (index <= remainder ? 1 : 0);
+  return items.slice(start, start + size);
+}
+
+/** Wallets this particular run is responsible for. */
+function getWalletList(batch) {
+  const all = loadAllWallets();
+  if (!batch) return all;
+  return sliceForBatch(all, batch.index, batch.total);
+}
+
+/**
+ * Target sheet tab, in priority order:
+ *   --sheet  >  TARGET_SHEET_NAME  >  "<BATCH_SHEET_PREFIX>NN"  >  GOOGLE_SHEET_NAME
+ * Giving every batch its own tab is what keeps parallel runners from clearing and
+ * overwriting each other's rows.
+ */
+function resolveSheetName(batch) {
+  if (CLI.sheet) return CLI.sheet;
+  if (process.env.TARGET_SHEET_NAME) return process.env.TARGET_SHEET_NAME;
+  if (batch) {
+    const prefix = process.env.BATCH_SHEET_PREFIX || 'Batch_';
+    return `${prefix}${String(batch.index).padStart(2, '0')}`;
+  }
+  return GOOGLE_SHEET_NAME;
+}
 
 const RATE_LIMIT_CONFIG = {
   // --- Request spacing (adaptive: widens on push-back, decays on success) ---
@@ -62,8 +216,16 @@ const RATE_LIMIT_CONFIG = {
   GLOBAL_TIMEOUT_MS: num('GLOBAL_TIMEOUT_MS', 20 * 60 * 1000),
   WRITE_RESERVE_MS: num('WRITE_RESERVE_MS', 90000),
 
+  // --- History depth ---
+  // Rabby caps a single history_all_list response; 2000 requests the full window.
+  PAGE_COUNT: num('PAGE_COUNT', 2000),
+
   // --- Google Sheets ---
   CHUNK_SIZE: num('CHUNK_SIZE', 500),
+  // Pause between chunk writes. Google allows ~60 write requests/minute/user and
+  // that quota is shared by every parallel matrix job, so this defaults high
+  // enough for 3–4 runners to write concurrently without tripping it.
+  SHEETS_WRITE_DELAY_MS: num('SHEETS_WRITE_DELAY_MS', 1500),
   // Safety guard: the sheet is a full-refresh snapshot, so writing a mostly-empty
   // result would destroy a good previous snapshot. Require this share of wallets
   // to have succeeded before the destructive clear+write is allowed.
@@ -338,9 +500,10 @@ class RateLimitManager {
 // ============================================================================
 
 async function fetchTransactions(walletAddress, rateLimitMgr) {
-  const url = `${RABBY_API_URL}?id=${walletAddress}`;
-  const masked = maskAddr(walletAddress);
   const cfg = RATE_LIMIT_CONFIG;
+  // page_count requests the full history window rather than the default page.
+  const url = `${RABBY_API_URL}?id=${walletAddress}&page_count=${cfg.PAGE_COUNT}`;
+  const masked = maskAddr(walletAddress);
 
   let blockRetries = 0;   // 429 + 403 attempts for THIS wallet
   let blockWaitMs = 0;    // total cooldown already spent on THIS wallet
@@ -564,36 +727,104 @@ async function getGoogleAuth() {
   }
 }
 
-/** Generic retry wrapper for Google API calls (exponential-ish linear backoff). */
-async function withRetry(fn, label, maxRetries = 3) {
+/**
+ * Generic retry wrapper for Google API calls.
+ *
+ * Quota errors (429 / RESOURCE_EXHAUSTED) get a longer exponential backoff: the
+ * ~60 writes/minute quota is shared by every parallel matrix job, so a couple of
+ * runners can legitimately collide and just need to wait their turn.
+ */
+async function withRetry(fn, label, maxRetries = 4) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (err) {
       const detail = err.errors?.[0]?.message || err.message;
+      const status = err.code || err.response?.status;
+      const isQuota = status === 429 ||
+        /quota|rate limit|RESOURCE_EXHAUSTED/i.test(detail || '');
+
       if (attempt === maxRetries) {
         throw new Error(`${label} failed after ${maxRetries} retries: ${detail}`);
       }
-      const waitSec = 5 * attempt;
-      log('WARN', `${label} failed [${attempt}/${maxRetries}] — retrying in ${waitSec}s: ${detail}`);
-      await sleep(waitSec * 1000);
+
+      const waitMs = isQuota
+        ? Math.min(60000, 10000 * Math.pow(2, attempt - 1)) + Math.random() * 3000
+        : 5000 * attempt;
+      log('WARN', `${label} failed [${attempt}/${maxRetries}]${isQuota ? ' (quota)' : ''} — ` +
+        `retrying in ${fmtDuration(waitMs)}: ${detail}`);
+      await sleep(waitMs);
     }
   }
 }
 
-/** Look up the target tab's sheetId + current grid size. */
-async function getSheetProps(sheets) {
+// Header written into row 1 when a batch tab is created (mirrors mapTransactionToRow).
+const SHEET_HEADER = [
+  'cate_id', 'cex_id', 'chain', 'id', 'idx', 'is_scam', 'other_addr', 'project_id',
+  'recv_amount', 'recv_from_addr', 'recv_price', 'recv_token_id',
+  'send_amount', 'send_price', 'send_to_addr', 'send_token_id',
+  'time_at',
+  'approve_label', 'approve_spender', 'approve_token_id', 'approve_value',
+  'tx_label', 'tx_eth_gas_fee', 'tx_from_addr', 'tx_id', 'tx_idx',
+  'tx_message', 'tx_name', 'tx_params', 'tx_selector', 'tx_status', 'tx_to_addr',
+  'tx_usd_gas_fee', 'tx_value', 'recorded_at',
+];
+
+/** Look up a tab's sheetId + current grid size, or null when it doesn't exist. */
+async function findSheetProps(sheets, sheetName) {
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
     fields: 'sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))',
   });
-  const sheet = (meta.data.sheets || []).find(
-    (s) => s.properties.title === GOOGLE_SHEET_NAME
-  );
-  if (!sheet) {
-    throw new Error(`Sheet tab "${GOOGLE_SHEET_NAME}" not found in spreadsheet`);
+  const sheet = (meta.data.sheets || []).find((s) => s.properties.title === sheetName);
+  return sheet ? sheet.properties : null;
+}
+
+/**
+ * Return the tab's properties, creating the tab (with a header row) if missing.
+ *
+ * Batch tabs like Batch_01..Batch_10 won't exist on the first run, and several
+ * matrix jobs may reach this at the same time — a concurrent creation that loses
+ * the race surfaces as "already exists", which we resolve by re-reading.
+ */
+async function ensureSheetTab(sheets, sheetName) {
+  const existing = await withRetry(
+    () => findSheetProps(sheets, sheetName), `Look up tab "${sheetName}"`);
+  if (existing) return existing;
+
+  log('INFO', `Tab "${sheetName}" not found — creating it`);
+  try {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      resource: {
+        requests: [{
+          addSheet: {
+            properties: {
+              title: sheetName,
+              gridProperties: { rowCount: 1000, columnCount: SHEET_HEADER.length },
+            },
+          },
+        }],
+      },
+    });
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      range: `${sheetName}!A1`,
+      valueInputOption: 'RAW',
+      resource: { values: [SHEET_HEADER] },
+    });
+    log('OK', `Created tab "${sheetName}" with header row`);
+  } catch (err) {
+    const detail = err.errors?.[0]?.message || err.message;
+    if (!/already exists/i.test(detail)) throw err;
+    log('DEBUG', `Tab "${sheetName}" was created concurrently by another job`);
   }
-  return sheet.properties;
+
+  const props = await withRetry(
+    () => findSheetProps(sheets, sheetName), `Re-read tab "${sheetName}"`);
+  if (!props) throw new Error(`Sheet tab "${sheetName}" could not be created or found`);
+  return props;
 }
 
 /**
@@ -604,10 +835,13 @@ async function getSheetProps(sheets) {
  * grew without bound until it hit Google's hard limit of 10,000,000 cells and the
  * job crashed. Overwriting in place keeps the grid a fixed size, and we additionally
  * trim any leftover rows so the grid never bloats again.
+ *
+ * `sheetName` scopes every operation — clear, write and trim — to one tab, so
+ * parallel matrix jobs writing different batches never touch each other's rows.
  */
-async function writeToSheet(rows) {
+async function writeToSheet(rows, sheetName) {
   if (rows.length === 0) {
-    log('WARN', 'No data fetched — leaving the sheet untouched (safe-guard)');
+    log('WARN', `No data fetched — leaving "${sheetName}" untouched (safe-guard)`);
     return 0;
   }
 
@@ -615,7 +849,8 @@ async function writeToSheet(rows) {
   const auth = await getGoogleAuth();
   const sheets = google.sheets({ version: 'v4', auth, timeout: 60000 });
 
-  const props = await withRetry(() => getSheetProps(sheets), 'Get sheet metadata');
+  // Creates the tab on first use so each batch owns its own target.
+  const props = await ensureSheetTab(sheets, sheetName);
   const sheetId = props.sheetId;
   const currentRowCount = props.gridProperties?.rowCount || 1000;
 
@@ -647,9 +882,9 @@ async function writeToSheet(rows) {
   // 2) Clear old values under the header.
   await withRetry(() => sheets.spreadsheets.values.clear({
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
-    range: `${GOOGLE_SHEET_NAME}!A2:AI`,
-  }), 'Clear sheet');
-  log('OK', 'Cleared previous values (A2:AI)');
+    range: `${sheetName}!A2:AI`,
+  }), `Clear tab "${sheetName}"`);
+  log('OK', `Cleared previous values in "${sheetName}" (A2:AI)`);
 
   // 3) Overwrite in place, chunked (values.update — never inserts rows).
   const totalChunks = Math.ceil(values.length / RATE_LIMIT_CONFIG.CHUNK_SIZE);
@@ -662,7 +897,7 @@ async function writeToSheet(rows) {
 
     await withRetry(() => sheets.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: `${GOOGLE_SHEET_NAME}!A${startRow}`,
+      range: `${sheetName}!A${startRow}`,
       valueInputOption: 'RAW',
       resource: { values: chunk },
     }), `Write chunk ${chunkNum}/${totalChunks}`);
@@ -670,7 +905,11 @@ async function writeToSheet(rows) {
     log('INFO', `Chunk ${chunkNum}/${totalChunks} written (${chunk.length} rows @ row ${startRow})`);
 
     if (i + RATE_LIMIT_CONFIG.CHUNK_SIZE < values.length) {
-      await jitterDelay(500, 1500);
+      // Spaced out so parallel matrix jobs share the Sheets write quota safely.
+      await jitterDelay(
+        RATE_LIMIT_CONFIG.SHEETS_WRITE_DELAY_MS,
+        RATE_LIMIT_CONFIG.SHEETS_WRITE_DELAY_MS * 1.5
+      );
     }
   }
 
@@ -695,7 +934,7 @@ async function writeToSheet(rows) {
     log('OK', `Trimmed grid ${rowCountNow} → ${targetRowCount} rows (reclaimed cells)`);
   }
 
-  log('OK', `Successfully wrote ${c.bold(values.length)} rows to "${GOOGLE_SHEET_NAME}"`);
+  log('OK', `Successfully wrote ${c.bold(values.length)} rows to "${sheetName}"`);
   return values.length;
 }
 
@@ -706,7 +945,7 @@ async function writeToSheet(rows) {
  * insertDataOption:'INSERT_ROWS', which is what previously grew the grid past
  * Google's 10,000,000-cell limit.
  */
-async function appendToSheet(rows) {
+async function appendToSheet(rows, sheetName) {
   if (rows.length === 0) {
     log('WARN', 'No data to append');
     return 0;
@@ -715,6 +954,9 @@ async function appendToSheet(rows) {
   log('INFO', 'Authenticating with Google Sheets...');
   const auth = await getGoogleAuth();
   const sheets = google.sheets({ version: 'v4', auth, timeout: 60000 });
+
+  // Create the tab if this is the first thing to ever write to it.
+  await ensureSheetTab(sheets, sheetName);
 
   const recordedAt = getCurrentTimestampTH();
   const values = rows.map((row) => {
@@ -731,7 +973,7 @@ async function appendToSheet(rows) {
 
     await withRetry(() => sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: `${GOOGLE_SHEET_NAME}!A2:AI`,
+      range: `${sheetName}!A2:AI`,
       valueInputOption: 'RAW',
       resource: { values: chunk },
     }), `Append chunk ${chunkNum}/${totalChunks}`);
@@ -743,7 +985,7 @@ async function appendToSheet(rows) {
     }
   }
 
-  log('OK', `Appended ${c.bold(values.length)} rows to "${GOOGLE_SHEET_NAME}"`);
+  log('OK', `Appended ${c.bold(values.length)} rows to "${sheetName}"`);
   return values.length;
 }
 
@@ -753,17 +995,32 @@ async function appendToSheet(rows) {
 
 async function processTransactions() {
   const startTime = Date.now();
-  const wallets = getWalletList();
+  const batch = resolveBatch();
+  const sheetName = resolveSheetName(batch);
+  const allWallets = loadAllWallets();
+  const wallets = getWalletList(batch);
 
+  if (allWallets.length === 0) {
+    throw new Error('No wallets configured. Set WALLET_LIST (or WALLETS_FILE).');
+  }
   if (wallets.length === 0) {
-    throw new Error('No wallets configured. Set WALLET_LIST environment variable.');
+    // A batch can legitimately come up empty if TOTAL exceeds the wallet count.
+    log('WARN', `Batch ${batch?.index}/${batch?.total} has no wallets ` +
+      `(only ${allWallets.length} configured) — nothing to do`);
+    return { success: true, totalRaw: 0, totalFiltered: 0, written: 0,
+      okCount: 0, errorCount: 0, skipped: 0, stopReason: null, sheetName, batch };
   }
 
   if (!GOOGLE_SPREADSHEET_ID) {
     throw new Error('GOOGLE_SPREADSHEET_ID not configured');
   }
 
-  log('INFO', `${c.bold('Starting sync')} for ${c.bold(wallets.length)} wallet(s)`);
+  const scope = batch
+    ? `${c.bold(`batch ${batch.index}/${batch.total}`)} — wallets ` +
+      `${c.bold(wallets.length)} of ${allWallets.length}`
+    : `${c.bold(wallets.length)} wallet(s)`;
+  log('INFO', `${c.bold('Starting sync')} for ${scope} → tab ${c.cyan(sheetName)} ` +
+    `${c.dim(`(page_count=${RATE_LIMIT_CONFIG.PAGE_COUNT})`)}`);
 
   const rateLimitMgr = new RateLimitManager();
   const allRows = [];
@@ -867,21 +1124,19 @@ async function processTransactions() {
   if (okCount > 0 && successRatio < RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO) {
     log('WARN', `${c.bold('Sheet NOT updated')} — only ${okCount}/${wallets.length} wallets succeeded ` +
       `(below MIN_SUCCESS_RATIO ${RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO}). ` +
-      `Previous snapshot preserved.`);
-    return { success: true, totalRaw, totalFiltered, written: 0, okCount, errorCount, skipped, stopReason };
+      `Tab "${sheetName}" preserved.`);
+    return { success: true, totalRaw, totalFiltered, written: 0, okCount, errorCount,
+      skipped, stopReason, sheetName, batch };
   }
 
-  const written = await writeToSheet(allRows);
+  const written = await writeToSheet(allRows, sheetName);
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  log('OK', `${c.bold('Sync completed')} in ${elapsed}s — ${written} rows written`);
+  log('OK', `${c.bold('Sync completed')} in ${elapsed}s — ${written} rows written to "${sheetName}"`);
 
-  return { success: true, totalRaw, totalFiltered, written, okCount, errorCount, skipped, stopReason };
+  return { success: true, totalRaw, totalFiltered, written, okCount, errorCount,
+    skipped, stopReason, sheetName, batch };
 }
-
-// ============================================================================
-// ENTRY POINT
-// ============================================================================
 
 // ============================================================================
 // MANUAL RETRY MODE — re-fetch a single wallet and append it
@@ -889,11 +1144,39 @@ async function processTransactions() {
 // Useful after a run where one wallet was skipped by the soft-block guard:
 //   node src/index.js 0xabc...     (appends, never clears the sheet)
 
+/**
+ * Work out which batch a wallet belongs to, so a manual retry appends to the same
+ * tab the scheduled run would have written it to. Returns null when batching isn't
+ * configured or the wallet isn't in the list.
+ */
+function findBatchForWallet(addr, total) {
+  if (!Number.isInteger(total) || total < 1) return null;
+  const all = loadAllWallets();
+  if (!all.includes(addr)) return null;
+  for (let index = 1; index <= total; index++) {
+    if (sliceForBatch(all, index, total).includes(addr)) return { index, total };
+  }
+  return null;
+}
+
 async function runManualMode(walletAddress) {
   const addr = walletAddress.trim().toLowerCase();
   const masked = maskAddr(addr);
 
-  log('INFO', `${c.bold('Manual retry mode')} — ${c.magenta(masked)} ${c.dim('(append only, sheet not cleared)')}`);
+  // Pick the tab this wallet actually belongs to, so a retry can't land in the
+  // wrong batch's tab: explicit --sheet/--batch first, then auto-detection.
+  let batch = resolveBatch();
+  if (!batch && !CLI.sheet && !process.env.TARGET_SHEET_NAME) {
+    const total = process.env.BATCH_TOTAL ? num('BATCH_TOTAL', 0) : null;
+    batch = findBatchForWallet(addr, total);
+    if (batch) {
+      log('INFO', `${c.magenta(masked)} belongs to batch ${batch.index}/${batch.total}`);
+    }
+  }
+  const sheetName = resolveSheetName(batch);
+
+  log('INFO', `${c.bold('Manual retry mode')} — ${c.magenta(masked)} → tab ${c.cyan(sheetName)} ` +
+    `${c.dim('(append only, tab not cleared)')}`);
 
   const rateLimitMgr = new RateLimitManager();
   const { payload, attempts } = await fetchTransactions(addr, rateLimitMgr);
@@ -915,9 +1198,10 @@ async function runManualMode(walletAddress) {
     }
   }
 
-  const written = await appendToSheet(rows);
-  log('OK', `${c.bold('Manual retry completed')} in ${fmtDuration(elapsedMs())} — ${written} rows appended`);
-  return { success: true, written, wallet: masked };
+  const written = await appendToSheet(rows, sheetName);
+  log('OK', `${c.bold('Manual retry completed')} in ${fmtDuration(elapsedMs())} — ` +
+    `${written} rows appended to "${sheetName}"`);
+  return { success: true, written, wallet: masked, sheetName };
 }
 
 // ============================================================================
@@ -927,35 +1211,51 @@ async function runManualMode(walletAddress) {
 // to collide with), and a lock left behind by a cancelled run would permanently
 // break every future run.
 
-const LOCK_FILE = path.join(__dirname, '..', '.bot.lock');
 const LOCK_STALE_MS = 30 * 60 * 1000;
-let lockHeld = false;
+let lockFile = null;
+
+/**
+ * The lock is scoped to the target tab: two batches write different tabs and may
+ * safely run side by side locally, but two runs targeting the same tab must not.
+ */
+function lockFileFor() {
+  let suffix = '';
+  try {
+    const name = resolveSheetName(resolveBatch());
+    suffix = '.' + String(name).replace(/[^A-Za-z0-9_-]/g, '_');
+  } catch {
+    /* bad batch args are reported later by the real code path */
+  }
+  return path.join(__dirname, '..', `.bot${suffix}.lock`);
+}
 
 function acquireLock() {
   if (IN_GHA) return; // CI runs are isolated; a stale lock would only cause harm
 
-  if (fs.existsSync(LOCK_FILE)) {
-    const ageMs = Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
+  const file = lockFileFor();
+
+  if (fs.existsSync(file)) {
+    const ageMs = Date.now() - fs.statSync(file).mtimeMs;
     if (ageMs < LOCK_STALE_MS) {
-      const pid = fs.readFileSync(LOCK_FILE, 'utf8').trim();
-      throw new Error(`Another instance appears to be running (PID ${pid}, lock age ${fmtDuration(ageMs)}). ` +
-        `Delete ${LOCK_FILE} if that is wrong.`);
+      const pid = fs.readFileSync(file, 'utf8').trim();
+      throw new Error(`Another instance is already writing this tab (PID ${pid}, ` +
+        `lock age ${fmtDuration(ageMs)}). Delete ${file} if that is wrong.`);
     }
     log('WARN', `Ignoring stale lock file (age ${fmtDuration(ageMs)})`);
   }
 
-  fs.writeFileSync(LOCK_FILE, String(process.pid));
-  lockHeld = true;
+  fs.writeFileSync(file, String(process.pid));
+  lockFile = file;
 }
 
 function releaseLock() {
-  if (!lockHeld) return;
+  if (!lockFile) return;
   try {
-    fs.unlinkSync(LOCK_FILE);
+    fs.unlinkSync(lockFile);
   } catch {
     /* already gone — nothing to do */
   }
-  lockHeld = false;
+  lockFile = null;
 }
 
 // Release the lock however the process ends, including Ctrl-C and the SIGTERM
@@ -975,17 +1275,20 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 
 async function main() {
   try {
+    if (CLI.help) {
+      console.log(HELP_TEXT.trim());
+      process.exit(0);
+    }
+
     acquireLock();
 
-    // A single 0x-address argument switches to manual retry mode.
-    const arg = process.argv[2];
+    // A wallet address (positional or --wallet) switches to manual retry mode.
     let result;
-
-    if (arg) {
-      if (!/^0x[0-9a-fA-F]{40}$/.test(arg)) {
-        throw new Error(`Invalid wallet address: "${arg}" (expected 0x + 40 hex chars)`);
+    if (CLI.wallet) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(CLI.wallet)) {
+        throw new Error(`Invalid wallet address: "${CLI.wallet}" (expected 0x + 40 hex chars)`);
       }
-      result = await runManualMode(arg);
+      result = await runManualMode(CLI.wallet);
     } else {
       result = await processTransactions();
     }
@@ -1019,6 +1322,12 @@ module.exports = {
   fetchBudgetRemainingMs,
   fetchTransactions,
   processTransactions,
+  parseArgs,
+  sliceForBatch,
+  loadAllWallets,
+  resolveBatch,
+  resolveSheetName,
+  SHEET_HEADER,
   mapTransactionToRow,
   maskAddr,
   RATE_LIMIT_CONFIG,
