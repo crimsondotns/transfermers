@@ -100,15 +100,15 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `PAGE_COUNT` — Total transactions to collect per wallet (default: `2000`)
 - `PAGE_SIZE` — Rows per API request (default: `200`)
 - `MAX_PAGES_PER_WALLET` — Anti-runaway page cap (default: `20`)
-- `PAGE_DELAY_MS` — Spacing between pages of one wallet (default: `500`)
+- `PAGE_DELAY_MIN_MS` / `PAGE_DELAY_MAX_MS` — Random spacing between pages of one wallet (default: `1500` / `2000`)
+- `PROXY_URL` — Route API traffic through a proxy (also reads `HTTPS_PROXY` / `HTTP_PROXY`, honours `NO_PROXY`)
 - `SHEETS_WRITE_DELAY_MS` — Pause between Sheets chunk writes (default: `1500`)
 - `LOG_LEVEL` — `INFO` (default) or `DEBUG` for verbose per-request logs
 - `NO_COLOR` — set to disable ANSI colors in logs
 - `GLOBAL_TIMEOUT_MS` — Stop fetching after this long, ms (default: `1200000` = 20 min)
 - `WRITE_RESERVE_MS` — Time reserved for the Sheets write, ms (default: `90000`)
-- `JITTER_MIN_MS` — Min request spacing, ms (default: `3000`)
-- `JITTER_MAX_MS` — Max request spacing, ms (default: `6000`)
-- `MAX_DELAY_MS` — Ceiling for adaptive spacing, ms (default: `20000`)
+- `JITTER_MIN_MS` / `JITTER_MAX_MS` — Random spacing band per request, ms (default: `5000` / `12000`)
+- `MAX_DELAY_MS` — Ceiling for adaptive spacing, ms (default: `30000`)
 - `PENDING_BASE_MS` / `PENDING_STEP_MS` / `PENDING_MAX_MS` — Pending-job backoff (default: `20000` / `10000` / `60000`)
 - `MAX_PENDING_ROUNDS` — Max pending polls per wallet (default: `4`)
 - `RATE_LIMIT_WAIT_MS` — Base cooldown on 429/403 when no `Retry-After`, ms (default: `60000`)
@@ -170,7 +170,7 @@ own GitHub Actions matrix job, writing to its **own sheet tab**.
                           │
    ┌──────────┬───────────┼───────────┬──────────┐
    ▼          ▼           ▼           ▼          ▼
- batch 1    batch 2     batch 3    …   batch 10        (max-parallel: 3)
+ batch 1    batch 2     batch 3    …   batch 10        (max-parallel: 2)
    │          │           │           │          │
    ▼          ▼           ▼           ▼          ▼
 Batch_01   Batch_02    Batch_03    …   Batch_10        (one tab each)
@@ -209,17 +209,45 @@ env:
   BATCH_TOTAL: '10'                          # must equal the matrix length
 strategy:
   fail-fast: false                           # one blocked batch ≠ cancel the rest
-  max-parallel: 3                            # be polite to Rabby
+  max-parallel: 2                            # be polite to Rabby
   matrix:
     batch: [1,2,3,4,5,6,7,8,9,10]
 ```
 
 - **More batches** → fewer wallets per job → each job finishes faster
-- **Lower `max-parallel`** → gentler on Rabby's rate limit (3–4 recommended)
+- **Lower `max-parallel`** → gentler on Rabby's rate limit (2 recommended; raising it
+  is what produced the 403 soft-blocks)
 - `fail-fast: false` matters: without it, one blocked batch cancels the other nine
 
 Slicing is **deterministic and exact** — 200 wallets over 10 batches gives 20 each;
 205 gives `21,21,21,21,21,20,20,20,20,20`. No wallet is fetched twice or missed.
+
+### Keeping parallel jobs off the rate limiter
+
+All GitHub-hosted runners egress from shared Azure ranges, so the upstream sees
+the *combined* rate of every batch running at once. Three layers keep it low:
+
+| Layer | Setting |
+|---|---|
+| Fewer jobs at once | `max-parallel: 2` |
+| Jobs don't start in lockstep | Random 5–15s **stagger** step before the script runs |
+| Requests aren't evenly spaced | Random 5–12s per request, 1.5–2s between pages |
+
+### Optional proxy
+
+If the runner IP keeps getting soft-blocked, route egress elsewhere by setting a
+`PROXY_URL` secret (the workflow already passes it through):
+
+```bash
+PROXY_URL=http://user:pass@proxy.example.com:8080
+```
+
+`HTTPS_PROXY` / `HTTP_PROXY` are honoured too, and `NO_PROXY` exempts hosts
+(exact name, `.suffix`, or `*`). Credentials are masked in the logs. Leave the
+secret unset to send traffic directly — nothing changes.
+
+> Note: a custom `httpsAgent` makes axios ignore the proxy environment variables,
+> so the agent itself is built as a tunnelling agent when a proxy is configured.
 
 ### Google Sheets write quota
 
@@ -326,8 +354,9 @@ in total — not 2 minutes per page.
 **Respectful, adaptive, and time-bounded.** A single shared throttle governs *all*
 wallets in a run:
 
-1. **Normal operation** — 3–6s spacing between requests, which **decays** back toward
-   the floor after each success.
+1. **Normal operation** — every request waits a **random** 5–12s. The randomness
+   matters as much as the length: an exactly regular cadence is itself a bot
+   signal. The floor **decays** back down after each success.
 2. **Pending jobs** — the API answers `{ job: { status: "pending" } }` while it builds
    a wallet's history. Polling that every few seconds is what gets the IP soft-blocked,
    so waits step up **20s → 30s → 40s → 50s** (ceiling 60s), then the wallet is skipped.

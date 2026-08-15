@@ -3,6 +3,7 @@ require('dotenv').config();
 const axios = require('axios');
 const { google } = require('googleapis');
 const https = require('https');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const fs = require('fs');
 const path = require('path');
 
@@ -89,7 +90,11 @@ Key environment variables:
   PAGE_COUNT               Total transactions per wallet, across pages (default: 2000)
   PAGE_SIZE                Rows per API request (default: 200)
   MAX_PAGES_PER_WALLET     Anti-runaway page cap (default: 20)
-  PAGE_DELAY_MS            Spacing between pages of one wallet (default: 500)
+  PAGE_DELAY_MIN_MS        Min spacing between pages of one wallet (default: 1500)
+  PAGE_DELAY_MAX_MS        Max spacing between pages of one wallet (default: 2000)
+  JITTER_MIN_MS/JITTER_MAX_MS  Random spacing between requests (default: 5000/12000)
+  PROXY_URL                Route API traffic through a proxy (also honours
+                           HTTPS_PROXY / HTTP_PROXY, and NO_PROXY exemptions)
 
 See config/example.env for the full list, including the rate-limit and
 safety-timeout settings.
@@ -186,8 +191,11 @@ function resolveSheetName(batch) {
 
 const RATE_LIMIT_CONFIG = {
   // --- Request spacing (adaptive: widens on push-back, decays on success) ---
-  JITTER_MIN_MS: num('JITTER_MIN_MS', 3000),
-  JITTER_MAX_MS: num('JITTER_MAX_MS', 6000),
+  // Requests are spaced by a RANDOM value in [JITTER_MIN_MS, JITTER_MAX_MS].
+  // A wide, irregular range matters: perfectly even spacing is itself a bot
+  // signal, and the previous 3s fixed cadence contributed to the 403s.
+  JITTER_MIN_MS: num('JITTER_MIN_MS', 5000),
+  JITTER_MAX_MS: num('JITTER_MAX_MS', 12000),
   MAX_DELAY_MS: num('MAX_DELAY_MS', 20000),
 
   // --- Pending-job polling (progressive backoff) ---
@@ -227,9 +235,14 @@ const RATE_LIMIT_CONFIG = {
   PAGE_SIZE: num('PAGE_SIZE', 200),                       // rows per request
   MAX_TX_PER_WALLET: num('PAGE_COUNT', 2000),             // total rows per wallet
   MAX_PAGES_PER_WALLET: num('MAX_PAGES_PER_WALLET', 20),  // hard anti-runaway cap
-  // Spacing between pages of the SAME wallet. Much smaller than the inter-wallet
-  // spacing, but it is overridden by the adaptive delay as soon as a block is hit.
-  PAGE_DELAY_MS: num('PAGE_DELAY_MS', 500),
+  // Spacing between pages of the SAME wallet, picked at random in this range.
+  // Smaller than the inter-wallet spacing, but the adaptive delay overrides it
+  // as soon as a block is hit. PAGE_DELAY_MS is kept as a legacy alias for min.
+  PAGE_DELAY_MIN_MS: num('PAGE_DELAY_MIN_MS', num('PAGE_DELAY_MS', 1500)),
+  // Defaults to 4/3 of the min (so 1500 -> 2000) rather than a fixed 2000, which
+  // would turn a lowered min into a nonsensically wide band.
+  PAGE_DELAY_MAX_MS: num('PAGE_DELAY_MAX_MS',
+    Math.round(num('PAGE_DELAY_MIN_MS', num('PAGE_DELAY_MS', 1500)) * 4 / 3)),
 
   // --- Google Sheets ---
   CHUNK_SIZE: num('CHUNK_SIZE', 500),
@@ -252,14 +265,50 @@ const API_HEADERS = {
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 };
 
-// HTTPS Agent
-const HTTPS_AGENT = new https.Agent({
+// ---------------------------------------------------------------------------
+// HTTPS agent (proxy aware)
+// ---------------------------------------------------------------------------
+// Passing a custom `httpsAgent` to axios bypasses its built-in HTTP_PROXY /
+// HTTPS_PROXY handling entirely, so those variables used to be silently ignored.
+// We therefore resolve the proxy ourselves and build a tunnelling agent when one
+// is configured — ready for routing egress away from the shared runner IP.
+
+const AGENT_OPTIONS = {
   minVersion: 'TLSv1.2',
   keepAlive: true,
   maxSockets: 5,
   timeout: 60000,
   freeSocketTimeout: 30000,
-});
+};
+
+/** True when `host` matches a NO_PROXY entry (supports `*`, `.suffix`, exact). */
+function isProxyExempt(host) {
+  const raw = process.env.NO_PROXY || process.env.no_proxy || '';
+  return raw.split(',').map((e) => e.trim().toLowerCase()).filter(Boolean)
+    .some((entry) => entry === '*' ||
+      host === entry ||
+      host.endsWith(entry.startsWith('.') ? entry : `.${entry}`));
+}
+
+/** Proxy URL for `targetUrl`, honouring PROXY_URL > HTTPS_PROXY > HTTP_PROXY. */
+function resolveProxyUrl(targetUrl) {
+  let host;
+  try {
+    host = new URL(targetUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  if (isProxyExempt(host)) return null;
+  return process.env.PROXY_URL ||
+    process.env.HTTPS_PROXY || process.env.https_proxy ||
+    process.env.HTTP_PROXY || process.env.http_proxy ||
+    null;
+}
+
+const PROXY_URL = resolveProxyUrl(RABBY_API_URL);
+const HTTPS_AGENT = PROXY_URL
+  ? new HttpsProxyAgent(PROXY_URL, AGENT_OPTIONS)
+  : new https.Agent(AGENT_OPTIONS);
 
 // ============================================================================
 // LOGGING UTILITIES — ANSI colored, level-filtered, GitHub Actions aware
@@ -322,6 +371,20 @@ function fmtDuration(ms) {
   const m = Math.floor(total / 60);
   const s = total % 60;
   return s ? `${m}m${s}s` : `${m}m`;
+}
+
+/** Hide any credentials in a proxy URL before logging it. */
+function maskProxy(proxyUrl) {
+  try {
+    const u = new URL(proxyUrl);
+    if (u.username || u.password) {
+      u.username = '***';
+      u.password = '';
+    }
+    return u.toString();
+  } catch {
+    return '(set)';
+  }
 }
 
 function maskAddr(addr) {
@@ -455,12 +518,22 @@ class RateLimitManager {
       await sleep(waitMs);
     }
 
-    // Requests for further pages of the same wallet may pass a smaller spacing,
-    // but once a block has widened the adaptive delay that wins again — so the
+    // Base spacing = current adaptive delay + random jitter up to JITTER_MAX_MS.
+    // The randomness matters as much as the length: a fixed cadence is itself a
+    // bot signal. (JITTER_MAX_MS used to be unused here, so every request went
+    // out exactly JITTER_MIN_MS apart.)
+    const cfg = RATE_LIMIT_CONFIG;
+    const spread = Math.max(0, cfg.JITTER_MAX_MS - cfg.JITTER_MIN_MS);
+    const jittered = this.delayMs + Math.random() * spread;
+
+    // Pages of the same wallet may pass their own smaller spacing, but once a
+    // block has widened the adaptive delay the wider value wins again — so the
     // pagination loop can never out-run the throttle the server asked for.
-    let spacing = spacingOverrideMs ?? this.delayMs;
-    if (this.delayMs > RATE_LIMIT_CONFIG.JITTER_MIN_MS) {
-      spacing = Math.max(spacing, this.delayMs);
+    let spacing = jittered;
+    if (spacingOverrideMs != null) {
+      spacing = this.delayMs > cfg.JITTER_MIN_MS
+        ? Math.max(spacingOverrideMs, jittered)
+        : spacingOverrideMs;
     }
 
     const since = Date.now() - this.lastRequest;
@@ -573,6 +646,9 @@ async function fetchHistoryPage(walletAddress, startTime, rateLimitMgr, budget, 
         headers: API_HEADERS,
         timeout: 60000,
         httpsAgent: HTTPS_AGENT,
+        // Our agent already handles the proxy; letting axios apply the env vars
+        // as well would double-proxy the request.
+        proxy: false,
       });
 
       const body = response.data;
@@ -727,7 +803,11 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
     // First page uses the normal inter-wallet spacing; later pages of the SAME
     // wallet use the smaller page delay (still overridden by the adaptive delay
     // if the server has started pushing back).
-    const spacingMs = page === 1 ? undefined : cfg.PAGE_DELAY_MS;
+    // Math.max guards against a hand-configured max below the min.
+    const spacingMs = page === 1
+      ? undefined
+      : cfg.PAGE_DELAY_MIN_MS +
+        Math.random() * Math.max(0, cfg.PAGE_DELAY_MAX_MS - cfg.PAGE_DELAY_MIN_MS);
     const { list, attempts: pageAttempts } =
       await fetchHistoryPage(walletAddress, cursor, rateLimitMgr, budget, spacingMs);
     attempts += pageAttempts;
@@ -1167,6 +1247,9 @@ async function processTransactions() {
     : `${c.bold(wallets.length)} wallet(s)`;
   log('INFO', `${c.bold('Starting sync')} for ${scope} → tab ${c.cyan(sheetName)} ` +
     `${c.dim(`(page_count=${RATE_LIMIT_CONFIG.PAGE_COUNT})`)}`);
+  log('INFO', `Throttle: ${RATE_LIMIT_CONFIG.JITTER_MIN_MS}-${RATE_LIMIT_CONFIG.JITTER_MAX_MS}ms between ` +
+    `requests, ${RATE_LIMIT_CONFIG.PAGE_DELAY_MIN_MS}-${RATE_LIMIT_CONFIG.PAGE_DELAY_MAX_MS}ms between pages | ` +
+    `Egress: ${PROXY_URL ? c.cyan('proxy ' + maskProxy(PROXY_URL)) : 'direct'}`);
 
   const rateLimitMgr = new RateLimitManager();
   const collected = [];   // { timeAt, row } so everything can be sorted before writing
@@ -1490,6 +1573,9 @@ module.exports = {
   fetchBudgetRemainingMs,
   fetchTransactions,
   fetchHistoryPage,
+  resolveProxyUrl,
+  isProxyExempt,
+  maskProxy,
   processTransactions,
   parseArgs,
   sliceForBatch,
