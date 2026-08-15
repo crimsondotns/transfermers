@@ -72,10 +72,12 @@ jobs:
           BATCH_SHEET_PREFIX: 'Batch_'
           SHEETS_WRITE_DELAY_MS: '1500'  # shared ~60 writes/min quota across runners
 
-          # --- History depth & pagination ---
-          # One request cannot return 2000 rows, so the script pages through with
-          # a start_time cursor until it has PAGE_COUNT rows per wallet.
-          PAGE_COUNT: '2000'             # total rows per wallet (target)
+          # --- History window & pagination ---
+          # Fetch the last N DAYS (by time_at), not a row count. Paging stops as
+          # soon as the cursor walks past the window, which is what keeps request
+          # volume low: most wallets need 1-2 pages instead of 10.
+          HISTORY_DAYS: '90'
+          PAGE_COUNT: '2000'             # safety ceiling per wallet
           PAGE_SIZE: '200'               # rows per API request
           MAX_PAGES_PER_WALLET: '20'     # anti-runaway cap
           PAGE_DELAY_MIN_MS: '1500'      # spacing between pages of one wallet
@@ -93,6 +95,10 @@ jobs:
           JITTER_MIN_MS: '5000'
           JITTER_MAX_MS: '12000'
           MAX_DELAY_MS: '30000'
+
+          # Rotate the starting wallet each run so a mid-batch block cannot
+          # starve the same later wallets on every single run.
+          ROTATION_PERIOD_MS: '3600000'
 
           # --- Optional proxy (leave the secret unset to send traffic directly) ---
           PROXY_URL: ${{ secrets.PROXY_URL }}
