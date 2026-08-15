@@ -149,7 +149,31 @@ schedule:
 Trigger manually:
 1. Go to **Actions** tab
 2. Select **Rabby Transaction Sync** workflow
-3. Click **Run workflow** (optionally override the batch count)
+3. Click **Run workflow** — no inputs; the split comes from `BATCH_TOTAL`
+
+### Running batches by hand
+
+The quota is **per IP**. On Actions every matrix job gets a fresh runner, and
+therefore a fresh quota — that is why 25 small jobs work. Run locally and *all*
+batches share your one IP, so the quota applies across the whole session:
+
+```bash
+node src/index.js --batch 1/25     # ~4 wallets, ~8 requests — then stop
+# wait for the quota window before the next one
+node src/index.js --batch 2/25
+```
+
+- **One batch per sitting.** `MAX_REQUESTS_PER_RUN=8` stops the run cleanly, but
+  the next batch starts against the same, already-spent quota.
+- **Wait between batches.** The reset window is not documented; blocks were
+  observed lasting over 5 minutes. Start at ~15 minutes and shorten it only if
+  runs stay clean.
+- To cover everything from one IP, expect ~25 sittings — Actions does it in one
+  workflow precisely because each job gets a different IP.
+
+Nothing is lost by stopping early: unfetched wallets keep their rows
+(`MERGE_PRESERVE`) and the start position rotates (`ROTATION_PERIOD_MS`), so
+coverage converges across runs.
 
 ### Local Testing
 

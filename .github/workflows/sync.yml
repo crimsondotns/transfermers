@@ -5,12 +5,10 @@ on:
     # Full history for 200+ wallets is expensive — run it a few times a day, not
     # every 15 minutes. Every 6 hours is a sensible starting point.
     - cron: '0 */6 * * *'
+  # No inputs: the split is fixed by BATCH_TOTAL below, which must stay equal to
+  # the matrix length. A free-form input could disagree with it and every job
+  # past that number would fail with "batch index out of range".
   workflow_dispatch:
-    inputs:
-      batches:
-        description: 'How many batches to split the wallet list into'
-        required: false
-        default: '10'
 
 env:
   # Number of matrix slices. MUST match the length of the matrix.batch list below.
@@ -133,4 +131,4 @@ jobs:
           MERGE_PRESERVE: '1'
           MIN_SUCCESS_RATIO: '0.5'       # only consulted when MERGE_PRESERVE=0
         run: |
-          node src/index.js --batch ${{ matrix.batch }}/${{ github.event.inputs.batches || env.BATCH_TOTAL }}
+          node src/index.js --batch ${{ matrix.batch }}/${{ env.BATCH_TOTAL }}
