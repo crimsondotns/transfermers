@@ -7,7 +7,13 @@
     "start": "node src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["rabby", "crypto", "blockchain", "transaction", "google-sheets"],
+  "keywords": [
+    "rabby",
+    "crypto",
+    "blockchain",
+    "transaction",
+    "google-sheets"
+  ],
   "author": "crimson.crypto2021@gmail.com",
   "license": "MIT",
   "packageManager": "npm@10.0.0",
@@ -17,6 +23,7 @@
   "dependencies": {
     "axios": "^1.15.2",
     "dotenv": "^17.4.2",
-    "googleapis": "^171.4.0"
+    "googleapis": "^171.4.0",
+    "https-proxy-agent": "^9.1.0"
   }
 }

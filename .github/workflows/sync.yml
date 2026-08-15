@@ -27,8 +27,10 @@ jobs:
     strategy:
       # One blocked batch must not cancel the others — each writes its own tab.
       fail-fast: false
-      # Rabby sees all of these at once, so keep the concurrency low and polite.
-      max-parallel: 3
+      # All runners share GitHub's Azure egress ranges, so the upstream sees the
+      # combined request rate. Two at a time keeps that rate low enough to stay
+      # under the anti-bot threshold that was producing 403s.
+      max-parallel: 2
       matrix:
         batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
@@ -46,6 +48,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Even with max-parallel 2, concurrent jobs finish `npm ci` at almost the
+      # same moment and would then hit the API in lockstep. A random offset
+      # de-synchronises them before the first request goes out.
+      - name: Stagger start
+        run: |
+          DELAY=$(( (RANDOM % 11) + 5 ))   # 5-15 seconds
+          echo "Waiting ${DELAY}s to de-synchronise from sibling batch jobs..."
+          sleep "$DELAY"
 
       - name: Run transaction sync (batch ${{ matrix.batch }})
         env:
@@ -67,7 +78,8 @@ jobs:
           PAGE_COUNT: '2000'             # total rows per wallet (target)
           PAGE_SIZE: '200'               # rows per API request
           MAX_PAGES_PER_WALLET: '20'     # anti-runaway cap
-          PAGE_DELAY_MS: '500'           # spacing between pages of one wallet
+          PAGE_DELAY_MIN_MS: '1500'      # spacing between pages of one wallet
+          PAGE_DELAY_MAX_MS: '2000'
 
           LOG_LEVEL: 'INFO'
 
@@ -75,10 +87,15 @@ jobs:
           GLOBAL_TIMEOUT_MS: '1200000'   # stop fetching after 20 min
           WRITE_RESERVE_MS: '90000'      # keep 90s to flush results to Sheets
 
-          # --- Request spacing (adaptive) ---
-          JITTER_MIN_MS: '3000'
-          JITTER_MAX_MS: '6000'
-          MAX_DELAY_MS: '20000'
+          # --- Request spacing (adaptive + randomised) ---
+          # Each request waits a random 5-12s; the range is deliberately wide so
+          # the cadence is irregular rather than a fixed, fingerprintable beat.
+          JITTER_MIN_MS: '5000'
+          JITTER_MAX_MS: '12000'
+          MAX_DELAY_MS: '30000'
+
+          # --- Optional proxy (leave the secret unset to send traffic directly) ---
+          PROXY_URL: ${{ secrets.PROXY_URL }}
 
           # --- Pending-job polling: progressive backoff 20s -> 60s ---
           PENDING_BASE_MS: '20000'
