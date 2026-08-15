@@ -86,7 +86,10 @@ Key environment variables:
   TARGET_SHEET_NAME        Same as --sheet (CLI wins)
   BATCH_INDEX/BATCH_TOTAL  Same as --batch (CLI wins)
   BATCH_SHEET_PREFIX       Prefix for batch tabs (default: Batch_)
-  PAGE_COUNT               History depth per wallet (default: 2000)
+  PAGE_COUNT               Total transactions per wallet, across pages (default: 2000)
+  PAGE_SIZE                Rows per API request (default: 200)
+  MAX_PAGES_PER_WALLET     Anti-runaway page cap (default: 20)
+  PAGE_DELAY_MS            Spacing between pages of one wallet (default: 500)
 
 See config/example.env for the full list, including the rate-limit and
 safety-timeout settings.
@@ -216,9 +219,17 @@ const RATE_LIMIT_CONFIG = {
   GLOBAL_TIMEOUT_MS: num('GLOBAL_TIMEOUT_MS', 20 * 60 * 1000),
   WRITE_RESERVE_MS: num('WRITE_RESERVE_MS', 90000),
 
-  // --- History depth ---
-  // Rabby caps a single history_all_list response; 2000 requests the full window.
-  PAGE_COUNT: num('PAGE_COUNT', 2000),
+  // --- History depth & pagination ---
+  // Rabby caps how many rows one history_all_list response can return, so asking
+  // for 2000 in a single request silently truncates the history. We instead page
+  // through with `start_time` (the oldest time_at seen so far) as the cursor and
+  // accumulate up to MAX_TX_PER_WALLET rows.
+  PAGE_SIZE: num('PAGE_SIZE', 200),                       // rows per request
+  MAX_TX_PER_WALLET: num('PAGE_COUNT', 2000),             // total rows per wallet
+  MAX_PAGES_PER_WALLET: num('MAX_PAGES_PER_WALLET', 20),  // hard anti-runaway cap
+  // Spacing between pages of the SAME wallet. Much smaller than the inter-wallet
+  // spacing, but it is overridden by the adaptive delay as soon as a block is hit.
+  PAGE_DELAY_MS: num('PAGE_DELAY_MS', 500),
 
   // --- Google Sheets ---
   CHUNK_SIZE: num('CHUNK_SIZE', 500),
@@ -435,7 +446,7 @@ class RateLimitManager {
    * Returns false when the remaining wait would run past the global deadline,
    * so the caller can bail out instead of sleeping into a workflow cancellation.
    */
-  async beforeRequest() {
+  async beforeRequest(spacingOverrideMs) {
     const now = Date.now();
     if (now < this.cooldownUntil) {
       const waitMs = this.cooldownUntil - now;
@@ -443,9 +454,18 @@ class RateLimitManager {
       log('WARN', `Cooldown active — waiting ${c.bold(fmtDuration(waitMs))} before next request`);
       await sleep(waitMs);
     }
+
+    // Requests for further pages of the same wallet may pass a smaller spacing,
+    // but once a block has widened the adaptive delay that wins again — so the
+    // pagination loop can never out-run the throttle the server asked for.
+    let spacing = spacingOverrideMs ?? this.delayMs;
+    if (this.delayMs > RATE_LIMIT_CONFIG.JITTER_MIN_MS) {
+      spacing = Math.max(spacing, this.delayMs);
+    }
+
     const since = Date.now() - this.lastRequest;
-    if (since < this.delayMs) {
-      await sleep(this.delayMs - since);
+    if (since < spacing) {
+      await sleep(spacing - since);
     }
     this.lastRequest = Date.now();
     return true;
@@ -499,14 +519,39 @@ class RateLimitManager {
 // API FETCH FUNCTION
 // ============================================================================
 
-async function fetchTransactions(walletAddress, rateLimitMgr) {
+/**
+ * Per-wallet budget shared by every page request for that wallet.
+ *
+ * Critical for PR #5's fail-fast guarantee: if each page tracked its own block
+ * budget, a 20-page wallet could spend 20 x WALLET_BLOCK_BUDGET_MS sitting in
+ * cooldowns. Threading one budget through the pagination loop keeps a blocked
+ * wallet capped at ~2 minutes total, exactly as before pagination existed.
+ */
+function newWalletBudget() {
+  return { blockRetries: 0, blockWaitMs: 0 };
+}
+
+/**
+ * Fetch ONE page of history.
+ *
+ * `startTime` is the pagination cursor: the API returns transactions older than
+ * that Unix timestamp. Pass 0 for the first (newest) page.
+ *
+ * All of the PR #5 retry behaviour lives here — pending-job progressive backoff,
+ * 429/403 fail-fast, timeout retries and the global deadline — operating on the
+ * shared `budget` so the limits stay per-wallet, not per-page.
+ */
+async function fetchHistoryPage(walletAddress, startTime, rateLimitMgr, budget, spacingMs) {
   const cfg = RATE_LIMIT_CONFIG;
-  // page_count requests the full history window rather than the default page.
-  const url = `${RABBY_API_URL}?id=${walletAddress}&page_count=${cfg.PAGE_COUNT}`;
   const masked = maskAddr(walletAddress);
 
-  let blockRetries = 0;   // 429 + 403 attempts for THIS wallet
-  let blockWaitMs = 0;    // total cooldown already spent on THIS wallet
+  const params = new URLSearchParams({
+    id: walletAddress,
+    page_count: String(cfg.PAGE_SIZE),
+  });
+  if (startTime > 0) params.set('start_time', String(startTime));
+  const url = `${RABBY_API_URL}?${params.toString()}`;
+
   let timeoutRetries = 0;
   let pendingRounds = 0;  // how many times the API said "job pending"
 
@@ -517,7 +562,7 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
     }
 
     // Honors any open cooldown; false means waiting it out would blow the deadline.
-    if (!(await rateLimitMgr.beforeRequest())) {
+    if (!(await rateLimitMgr.beforeRequest(spacingMs))) {
       throw new DeadlineError('not enough time left to wait out the cooldown');
     }
 
@@ -535,7 +580,7 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
 
       if (resultPayload && Array.isArray(resultPayload.history_list)) {
         rateLimitMgr.onSuccess();
-        return { payload: resultPayload, attempts: attempt };
+        return { list: resultPayload.history_list, attempts: attempt };
       }
 
       // ---- Job still pending: the API is building the history server-side ----
@@ -580,13 +625,13 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
       // WALLET_BLOCK_BUDGET_MS. Previously one blocked wallet could burn 13
       // minutes of the run; now it costs at most ~2 minutes before we move on.
       if (status === 429 || status === 403) {
-        blockRetries++;
-        const walletBudgetLeft = cfg.WALLET_BLOCK_BUDGET_MS - blockWaitMs;
+        budget.blockRetries++;
+        const walletBudgetLeft = cfg.WALLET_BLOCK_BUDGET_MS - budget.blockWaitMs;
 
-        if (blockRetries > cfg.MAX_BLOCK_RETRIES || walletBudgetLeft <= 0) {
+        if (budget.blockRetries > cfg.MAX_BLOCK_RETRIES || walletBudgetLeft <= 0) {
           throw new BlockedError(
-            `${status} soft-block — skipped after ${blockRetries} attempt(s) ` +
-            `and ${fmtDuration(blockWaitMs)} of cooldown`
+            `${status} soft-block — skipped after ${budget.blockRetries} attempt(s) ` +
+            `and ${fmtDuration(budget.blockWaitMs)} of cooldown`
           );
         }
 
@@ -609,12 +654,12 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
         }
 
         const cooldown = rateLimitMgr.onBlock(retryAfterMs, allowed);
-        blockWaitMs += cooldown;
+        budget.blockWaitMs += cooldown;
 
         const label = status === 429 ? '429 Too Many Requests' : '403 Forbidden (soft-block)';
         const src = retryAfterMs != null ? ' (Retry-After honored)' : '';
         log('WARN',
-          `${c.bold(label)} on ${masked} [${blockRetries}/${cfg.MAX_BLOCK_RETRIES}] — ` +
+          `${c.bold(label)} on ${masked} [${budget.blockRetries}/${cfg.MAX_BLOCK_RETRIES}] — ` +
           `cooling down ${c.bold(fmtDuration(cooldown))}${src}`);
 
         attempt--; // the cooldown is the penalty; don't also burn a normal attempt
@@ -645,6 +690,107 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
   }
 
   throw new Error(`Failed after ${cfg.MAX_RETRIES} attempts`);
+}
+
+/**
+ * Fetch a wallet's full history by paging through the API.
+ *
+ * Why this exists: asking for `page_count=2000` in one request does NOT return
+ * 2000 rows — the API caps a single response, so the history was silently cut
+ * off and the most recent transactions never reached the sheet. We now walk
+ * backwards through time, using the oldest `time_at` we've seen as `start_time`
+ * for the next page, until we have enough rows or the history runs out.
+ *
+ * Termination is guarded from every angle, so the loop can never run away:
+ *   1. MAX_PAGES_PER_WALLET   — hard page cap
+ *   2. empty page             — no more history
+ *   3. short page             — fewer rows than requested means the last page
+ *   4. no new unique ids      — API ignored the cursor / returned the same page
+ *   5. cursor didn't move back — timestamps stopped decreasing
+ *   6. MAX_TX_PER_WALLET      — collected enough
+ *   7. global deadline        — checked inside every page request
+ */
+async function fetchTransactions(walletAddress, rateLimitMgr) {
+  const cfg = RATE_LIMIT_CONFIG;
+  const masked = maskAddr(walletAddress);
+  const budget = newWalletBudget(); // shared across pages: keeps fail-fast per-wallet
+
+  const byId = new Map();   // de-duplicates rows that overlap between pages
+  let cursor = 0;           // start_time for the next page (0 = newest page)
+  let attempts = 0;
+  let page = 0;
+  let stopReason = null;
+
+  while (page < cfg.MAX_PAGES_PER_WALLET) {
+    page++;
+
+    // First page uses the normal inter-wallet spacing; later pages of the SAME
+    // wallet use the smaller page delay (still overridden by the adaptive delay
+    // if the server has started pushing back).
+    const spacingMs = page === 1 ? undefined : cfg.PAGE_DELAY_MS;
+    const { list, attempts: pageAttempts } =
+      await fetchHistoryPage(walletAddress, cursor, rateLimitMgr, budget, spacingMs);
+    attempts += pageAttempts;
+
+    // Guard 2: the history is exhausted.
+    if (list.length === 0) {
+      stopReason = `no more history after ${page} page(s)`;
+      break;
+    }
+
+    // Guard 4: count how many rows on this page we hadn't already seen.
+    let added = 0;
+    let oldest = Infinity;
+    for (const tx of list) {
+      const id = tx.id ?? `${tx.chain}:${tx.time_at}:${tx.idx}`;
+      if (!byId.has(id)) {
+        byId.set(id, tx);
+        added++;
+      }
+      const t = Number(tx.time_at) || 0;
+      if (t > 0 && t < oldest) oldest = t;
+    }
+
+    log('DEBUG', `${masked} page ${page}: ${list.length} rows (${added} new, ` +
+      `total ${byId.size}), oldest ${Number.isFinite(oldest) ? oldest : 'n/a'}`);
+
+    if (added === 0) {
+      stopReason = `page ${page} returned nothing new (cursor exhausted)`;
+      break;
+    }
+
+    // Guard 6: we have as much as we asked for.
+    if (byId.size >= cfg.MAX_TX_PER_WALLET) {
+      stopReason = `reached MAX_TX_PER_WALLET (${cfg.MAX_TX_PER_WALLET})`;
+      break;
+    }
+
+    // Guard 3: a short page means there is nothing older to fetch.
+    if (list.length < cfg.PAGE_SIZE) {
+      stopReason = `last page was short (${list.length} < ${cfg.PAGE_SIZE})`;
+      break;
+    }
+
+    // Guard 5: the cursor must strictly move backwards in time, otherwise the
+    // next request would return the same window forever.
+    if (!Number.isFinite(oldest) || oldest <= 0 || (cursor > 0 && oldest >= cursor)) {
+      stopReason = `cursor stopped advancing at ${oldest}`;
+      break;
+    }
+    cursor = oldest;
+  }
+
+  // Only when the loop ran to the cap without breaking for its own reason.
+  if (stopReason === null) {
+    stopReason = `hit MAX_PAGES_PER_WALLET (${cfg.MAX_PAGES_PER_WALLET})`;
+  }
+
+  // Newest first, so the sheet leads with the most recent activity.
+  const list = [...byId.values()].sort(
+    (a, b) => (Number(b.time_at) || 0) - (Number(a.time_at) || 0)
+  );
+
+  return { list, attempts, pages: page, stopReason };
 }
 
 // ============================================================================
@@ -1023,9 +1169,10 @@ async function processTransactions() {
     `${c.dim(`(page_count=${RATE_LIMIT_CONFIG.PAGE_COUNT})`)}`);
 
   const rateLimitMgr = new RateLimitManager();
-  const allRows = [];
+  const collected = [];   // { timeAt, row } so everything can be sorted before writing
   let totalRaw = 0;
   let totalFiltered = 0;
+  let totalScam = 0;
   let errorCount = 0;
 
   let okCount = 0;
@@ -1056,8 +1203,8 @@ async function processTransactions() {
     // Each wallet's chatter (retries, cooldowns) collapses into one group in Actions.
     groupStart(`[${i + 1}/${wallets.length}] ${masked}`);
     try {
-      const { payload, attempts } = await fetchTransactions(addr, rateLimitMgr);
-      const rawList = payload.history_list;
+      const { list: rawList, attempts, pages, stopReason: pageStop } =
+        await fetchTransactions(addr, rateLimitMgr);
 
       if (!Array.isArray(rawList)) {
         log('ERROR', `${masked}: unexpected response structure — skipped`);
@@ -1065,20 +1212,30 @@ async function processTransactions() {
         continue;
       }
 
-      const filtered = rawList.filter((tx) => tx.is_scam === false);
+      // Drop only transactions the API positively flags as scam. `is_scam === false`
+      // also discarded rows where the field is absent or null, which silently threw
+      // away legitimate history.
+      const filtered = rawList.filter((tx) => tx.is_scam !== true);
+      const scamDropped = rawList.length - filtered.length;
       const elapsed = ((Date.now() - walletStartTime) / 1000).toFixed(1);
 
+      const newest = rawList.length ? formatDateTH(rawList[0].time_at) : 'n/a';
       log('OK', `${c.magenta(masked)}: ${c.bold(filtered.length)} txs kept ` +
-        `(${rawList.length} raw, ${attempts} attempt(s), ${elapsed}s)`);
+        `(${rawList.length} fetched over ${pages} page(s), ${scamDropped} scam, ` +
+        `${attempts} request(s), ${elapsed}s) — newest ${c.cyan(newest)}`);
+      log('DEBUG', `${masked}: pagination stopped because ${pageStop}`);
 
       totalRaw += rawList.length;
       totalFiltered += filtered.length;
+      totalScam += scamDropped;
       okCount++;
       consecutiveBlocked = 0; // a success clears the breaker
 
       for (const tx of filtered) {
         try {
-          allRows.push(mapTransactionToRow(tx, addr));
+          // Keep the numeric timestamp alongside the row so every wallet's rows
+          // can be merged and sorted newest-first before the write.
+          collected.push({ timeAt: Number(tx.time_at) || 0, row: mapTransactionToRow(tx, addr) });
         } catch (mapErr) {
           log('WARN', `Mapping error for tx ${tx.id}: ${mapErr.message}`);
         }
@@ -1115,7 +1272,16 @@ async function processTransactions() {
 
   log('INFO', `${c.bold('Summary')} — ${c.green(okCount + ' ok')}, ${c.red(errorCount + ' failed')}, ` +
     `${c.yellow(skipped + ' skipped')} of ${wallets.length} | ` +
-    `${totalRaw} raw → ${c.bold(totalFiltered)} non-scam rows | elapsed ${fmtDuration(elapsedMs())}`);
+    `${totalRaw} fetched → ${c.bold(totalFiltered)} kept (${totalScam} scam) | ` +
+    `elapsed ${fmtDuration(elapsedMs())}`);
+
+  // Newest transaction first across every wallet in this batch.
+  collected.sort((a, b) => b.timeAt - a.timeAt);
+  const allRows = collected.map((entry) => entry.row);
+  if (allRows.length) {
+    log('INFO', `Sorted ${c.bold(allRows.length)} rows newest-first — ` +
+      `${c.cyan(formatDateTH(collected[0].timeAt))} → ${c.cyan(formatDateTH(collected[collected.length - 1].timeAt))}`);
+  }
 
   // Safety guard: the sheet is a full-refresh snapshot, so replacing a complete
   // snapshot with a mostly-failed one would destroy good data. Below the ratio we
@@ -1179,15 +1345,17 @@ async function runManualMode(walletAddress) {
     `${c.dim('(append only, tab not cleared)')}`);
 
   const rateLimitMgr = new RateLimitManager();
-  const { payload, attempts } = await fetchTransactions(addr, rateLimitMgr);
-  const rawList = payload.history_list;
+  const { list: rawList, attempts, pages } = await fetchTransactions(addr, rateLimitMgr);
 
   if (!Array.isArray(rawList)) {
     throw new Error('Unexpected response structure');
   }
 
-  const filtered = rawList.filter((tx) => tx.is_scam === false);
-  log('OK', `${c.magenta(masked)}: ${c.bold(filtered.length)} txs kept (${rawList.length} raw, ${attempts} attempt(s))`);
+  // Already sorted newest-first by fetchTransactions.
+  const filtered = rawList.filter((tx) => tx.is_scam !== true);
+  const newest = rawList.length ? formatDateTH(rawList[0].time_at) : 'n/a';
+  log('OK', `${c.magenta(masked)}: ${c.bold(filtered.length)} txs kept ` +
+    `(${rawList.length} fetched over ${pages} page(s), ${attempts} request(s)) — newest ${c.cyan(newest)}`);
 
   const rows = [];
   for (const tx of filtered) {
@@ -1321,6 +1489,7 @@ module.exports = {
   fmtDuration,
   fetchBudgetRemainingMs,
   fetchTransactions,
+  fetchHistoryPage,
   processTransactions,
   parseArgs,
   sliceForBatch,
