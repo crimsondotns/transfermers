@@ -9,7 +9,8 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ## ✨ Features
 
 ✅ **Scales to 200+ Wallets** — Batch split across parallel matrix jobs, one tab each  
-✅ **Full History** — Paginated with a `start_time` cursor, newest-first  
+✅ **Time-Windowed History** — Last 90 days by `time_at`, paginated newest-first  
+✅ **Fair Rotation** — Starting wallet rotates so a block can't starve the same wallets  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
 ✅ **Rate Limit Aware** — Adaptive throttling + exponential backoff  
 ✅ **429 Handling** — Respects rate limits, retries intelligently  
@@ -97,7 +98,9 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `BATCH_INDEX` / `BATCH_TOTAL` — Batch slice to process (same as `--batch N/TOTAL`)
 - `TARGET_SHEET_NAME` — Force a target tab (same as `--sheet`)
 - `BATCH_SHEET_PREFIX` — Prefix for batch tabs (default: `Batch_`)
-- `PAGE_COUNT` — Total transactions to collect per wallet (default: `2000`)
+- `HISTORY_DAYS` — Look-back window in days, by `time_at` (default: `90`; `0` = by row count only)
+- `ROTATION_PERIOD_MS` — Rotate the starting wallet each run (default: `3600000`; `0` disables)
+- `PAGE_COUNT` — Safety ceiling on rows per wallet (default: `2000`)
 - `PAGE_SIZE` — Rows per API request (default: `200`)
 - `MAX_PAGES_PER_WALLET` — Anti-runaway page cap (default: `20`)
 - `PAGE_DELAY_MIN_MS` / `PAGE_DELAY_MAX_MS` — Random spacing between pages of one wallet (default: `1500` / `2000`)
@@ -324,8 +327,19 @@ The script now walks backwards through time:
 ```
 page 1:  GET ?id=0x…&page_count=200                  → newest 200 rows
 page 2:  GET ?id=0x…&page_count=200&start_time=<oldest time_at so far>
-page 3:  … repeat until PAGE_COUNT rows or history runs out
+page 3:  … repeat until the look-back window is covered
 ```
+
+**The window is a time range, not a row count.** `HISTORY_DAYS=90` keeps every
+transaction whose `time_at` is within the last 90 days, and paging stops the
+moment the cursor crosses that boundary. This is the main lever on request
+volume — a typical wallet needs **1 request instead of 10**:
+
+| Wallet | With 90-day window | Without (2000 rows) |
+|---|---|---|
+| 2 txs/day, years of history | 1 page, 181 rows | 10 pages, 2000 rows |
+| Quiet (nothing recent) | 1 page, 10 rows | 10 pages |
+| Very busy (1 tx/min) | 10 pages (hits the 2000 ceiling) | 10 pages |
 
 Rows are de-duplicated by transaction id (pages can overlap) and the whole batch
 is **sorted newest-first** before being written, so row 2 of the sheet is always

@@ -87,7 +87,9 @@ Key environment variables:
   TARGET_SHEET_NAME        Same as --sheet (CLI wins)
   BATCH_INDEX/BATCH_TOTAL  Same as --batch (CLI wins)
   BATCH_SHEET_PREFIX       Prefix for batch tabs (default: Batch_)
-  PAGE_COUNT               Total transactions per wallet, across pages (default: 2000)
+  HISTORY_DAYS             Look-back window in days, by time_at (default: 90; 0 = off)
+  ROTATION_PERIOD_MS       Rotate the starting wallet each run (default: 3600000)
+  PAGE_COUNT               Safety ceiling on rows per wallet (default: 2000)
   PAGE_SIZE                Rows per API request (default: 200)
   MAX_PAGES_PER_WALLET     Anti-runaway page cap (default: 20)
   PAGE_DELAY_MIN_MS        Min spacing between pages of one wallet (default: 1500)
@@ -166,11 +168,25 @@ function sliceForBatch(items, index, total) {
   return items.slice(start, start + size);
 }
 
+/**
+ * Rotate the starting position so runs don't always process wallets in the same
+ * order. Without this, a soft-block part-way through a batch starves the SAME
+ * later wallets on every single run — they would never get fetched at all.
+ * The offset is time-derived (no state needed) and deterministic within a run.
+ */
+function rotateWallets(wallets) {
+  const period = RATE_LIMIT_CONFIG.ROTATION_PERIOD_MS;
+  if (wallets.length < 2 || period <= 0) return wallets;
+  const offset = Math.floor(Date.now() / period) % wallets.length;
+  if (offset === 0) return wallets;
+  return [...wallets.slice(offset), ...wallets.slice(0, offset)];
+}
+
 /** Wallets this particular run is responsible for. */
 function getWalletList(batch) {
   const all = loadAllWallets();
-  if (!batch) return all;
-  return sliceForBatch(all, batch.index, batch.total);
+  const mine = batch ? sliceForBatch(all, batch.index, batch.total) : all;
+  return rotateWallets(mine);
 }
 
 /**
@@ -220,6 +236,11 @@ const RATE_LIMIT_CONFIG = {
   MAX_RETRIES: num('MAX_RETRIES', 10),
   MAX_TIMEOUT_RETRIES: num('MAX_TIMEOUT_RETRIES', 5),
 
+  // Wallets were processed in the same order every run, so whenever a block hit
+  // part-way through, the SAME later wallets were starved every single time.
+  // Rotating the starting position spreads that cost around. 0 disables it.
+  ROTATION_PERIOD_MS: num('ROTATION_PERIOD_MS', 3600000),
+
   // --- Global safety guard (prevents a GitHub Actions "Canceled") ---
   // The workflow's own timeout is 30 min. We stop fetching well before that and
   // reserve time to flush whatever we already have to Google Sheets, so the run
@@ -232,8 +253,15 @@ const RATE_LIMIT_CONFIG = {
   // for 2000 in a single request silently truncates the history. We instead page
   // through with `start_time` (the oldest time_at seen so far) as the cursor and
   // accumulate up to MAX_TX_PER_WALLET rows.
+  // Look-back window: keep transactions newer than this many days and stop
+  // paging as soon as the cursor walks past it. This is a TIME window, not a
+  // row count — it is what keeps request volume low, because most wallets need
+  // one or two pages to cover 90 days instead of ten to reach 2000 rows.
+  // Set to 0 to disable and fall back to the MAX_TX_PER_WALLET ceiling alone.
+  HISTORY_DAYS: num('HISTORY_DAYS', 90),
+
   PAGE_SIZE: num('PAGE_SIZE', 200),                       // rows per request
-  MAX_TX_PER_WALLET: num('PAGE_COUNT', 2000),             // total rows per wallet
+  MAX_TX_PER_WALLET: num('PAGE_COUNT', 2000),             // safety ceiling per wallet
   MAX_PAGES_PER_WALLET: num('MAX_PAGES_PER_WALLET', 20),  // hard anti-runaway cap
   // Spacing between pages of the SAME wallet, picked at random in this range.
   // Smaller than the inter-wallet spacing, but the adaptive delay overrides it
@@ -791,6 +819,12 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
   const masked = maskAddr(walletAddress);
   const budget = newWalletBudget(); // shared across pages: keeps fail-fast per-wallet
 
+  // Unix seconds; anything older than this is outside the look-back window.
+  // Pages arrive newest-first, so the moment the cursor crosses it we are done.
+  const cutoff = cfg.HISTORY_DAYS > 0
+    ? Math.floor(Date.now() / 1000) - cfg.HISTORY_DAYS * 86400
+    : 0;
+
   const byId = new Map();   // de-duplicates rows that overlap between pages
   let cursor = 0;           // start_time for the next page (0 = newest page)
   let attempts = 0;
@@ -839,7 +873,14 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
       break;
     }
 
-    // Guard 6: we have as much as we asked for.
+    // Guard 6a: the look-back window is covered — the rest of this wallet's
+    // history is older than we care about, so stop paging.
+    if (cutoff > 0 && Number.isFinite(oldest) && oldest <= cutoff) {
+      stopReason = `covered the ${cfg.HISTORY_DAYS}-day window`;
+      break;
+    }
+
+    // Guard 6b: we have as much as we asked for.
     if (byId.size >= cfg.MAX_TX_PER_WALLET) {
       stopReason = `reached MAX_TX_PER_WALLET (${cfg.MAX_TX_PER_WALLET})`;
       break;
@@ -865,12 +906,16 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
     stopReason = `hit MAX_PAGES_PER_WALLET (${cfg.MAX_PAGES_PER_WALLET})`;
   }
 
-  // Newest first, so the sheet leads with the most recent activity.
-  const list = [...byId.values()].sort(
-    (a, b) => (Number(b.time_at) || 0) - (Number(a.time_at) || 0)
-  );
+  // Drop anything that fell outside the window (the last page usually straddles
+  // the cutoff), then sort newest-first so the sheet leads with recent activity.
+  let list = [...byId.values()];
+  const fetched = list.length;
+  if (cutoff > 0) {
+    list = list.filter((tx) => (Number(tx.time_at) || 0) >= cutoff);
+  }
+  list.sort((a, b) => (Number(b.time_at) || 0) - (Number(a.time_at) || 0));
 
-  return { list, attempts, pages: page, stopReason };
+  return { list, attempts, pages: page, stopReason, fetched, cutoff };
 }
 
 // ============================================================================
@@ -1245,8 +1290,12 @@ async function processTransactions() {
     ? `${c.bold(`batch ${batch.index}/${batch.total}`)} — wallets ` +
       `${c.bold(wallets.length)} of ${allWallets.length}`
     : `${c.bold(wallets.length)} wallet(s)`;
+  const cfg0 = RATE_LIMIT_CONFIG;
+  const windowLabel = cfg0.HISTORY_DAYS > 0
+    ? `last ${cfg0.HISTORY_DAYS} days (since ${formatDateTH(Math.floor(Date.now() / 1000) - cfg0.HISTORY_DAYS * 86400)})`
+    : `up to ${cfg0.MAX_TX_PER_WALLET} rows`;
   log('INFO', `${c.bold('Starting sync')} for ${scope} → tab ${c.cyan(sheetName)} ` +
-    `${c.dim(`(page_count=${RATE_LIMIT_CONFIG.PAGE_COUNT})`)}`);
+    `${c.dim(`(${windowLabel})`)}`);
   log('INFO', `Throttle: ${RATE_LIMIT_CONFIG.JITTER_MIN_MS}-${RATE_LIMIT_CONFIG.JITTER_MAX_MS}ms between ` +
     `requests, ${RATE_LIMIT_CONFIG.PAGE_DELAY_MIN_MS}-${RATE_LIMIT_CONFIG.PAGE_DELAY_MAX_MS}ms between pages | ` +
     `Egress: ${PROXY_URL ? c.cyan('proxy ' + maskProxy(PROXY_URL)) : 'direct'}`);
@@ -1286,7 +1335,7 @@ async function processTransactions() {
     // Each wallet's chatter (retries, cooldowns) collapses into one group in Actions.
     groupStart(`[${i + 1}/${wallets.length}] ${masked}`);
     try {
-      const { list: rawList, attempts, pages, stopReason: pageStop } =
+      const { list: rawList, attempts, pages, stopReason: pageStop, fetched } =
         await fetchTransactions(addr, rateLimitMgr);
 
       if (!Array.isArray(rawList)) {
@@ -1303,9 +1352,10 @@ async function processTransactions() {
       const elapsed = ((Date.now() - walletStartTime) / 1000).toFixed(1);
 
       const newest = rawList.length ? formatDateTH(rawList[0].time_at) : 'n/a';
+      const outsideWindow = (fetched ?? rawList.length) - rawList.length;
       log('OK', `${c.magenta(masked)}: ${c.bold(filtered.length)} txs kept ` +
-        `(${rawList.length} fetched over ${pages} page(s), ${scamDropped} scam, ` +
-        `${attempts} request(s), ${elapsed}s) — newest ${c.cyan(newest)}`);
+        `(${pages} page(s), ${attempts} request(s), ${scamDropped} scam, ` +
+        `${outsideWindow} outside window, ${elapsed}s) — newest ${c.cyan(newest)}`);
       log('DEBUG', `${masked}: pagination stopped because ${pageStop}`);
 
       totalRaw += rawList.length;
@@ -1579,6 +1629,7 @@ module.exports = {
   processTransactions,
   parseArgs,
   sliceForBatch,
+  rotateWallets,
   loadAllWallets,
   resolveBatch,
   resolveSheetName,
