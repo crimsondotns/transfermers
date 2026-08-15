@@ -86,15 +86,22 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `GOOGLE_SHEET_NAME` — Sheet tab name (default: `Sheet1`)
 - `LOG_LEVEL` — `INFO` (default) or `DEBUG` for verbose per-request logs
 - `NO_COLOR` — set to disable ANSI colors in logs
+- `GLOBAL_TIMEOUT_MS` — Stop fetching after this long, ms (default: `1200000` = 20 min)
+- `WRITE_RESERVE_MS` — Time reserved for the Sheets write, ms (default: `90000`)
 - `JITTER_MIN_MS` — Min request spacing, ms (default: `3000`)
 - `JITTER_MAX_MS` — Max request spacing, ms (default: `6000`)
 - `MAX_DELAY_MS` — Ceiling for adaptive spacing, ms (default: `20000`)
+- `PENDING_BASE_MS` / `PENDING_STEP_MS` / `PENDING_MAX_MS` — Pending-job backoff (default: `20000` / `10000` / `60000`)
+- `MAX_PENDING_ROUNDS` — Max pending polls per wallet (default: `4`)
 - `RATE_LIMIT_WAIT_MS` — Base cooldown on 429/403 when no `Retry-After`, ms (default: `60000`)
-- `MAX_COOLDOWN_MS` — Hard cap on a single cooldown, ms (default: `300000`)
+- `MAX_COOLDOWN_MS` — Hard cap on a single cooldown, ms (default: `120000`)
+- `MAX_BLOCK_RETRIES` — 429/403 retries per wallet before skipping (default: `2`)
+- `WALLET_BLOCK_BUDGET_MS` — Max total cooldown per blocked wallet, ms (default: `120000`)
+- `CIRCUIT_BREAKER_THRESHOLD` — Consecutive blocks before stopping the run (default: `2`)
 - `MAX_RETRIES` — Max attempts per wallet (default: `10`)
-- `MAX_BLOCK_RETRIES` — Max 429/403 cooldowns per wallet before skipping (default: `4`)
 - `MAX_TIMEOUT_RETRIES` — Max retries for timeouts (default: `5`)
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
+- `MIN_SUCCESS_RATIO` — Min share of wallets that must succeed before overwriting the sheet (default: `0.5`)
 - `HTTP_USER_AGENT` — Override the request User-Agent (optional)
 
 See `config/example.env` for full template.
@@ -195,22 +202,58 @@ npm start
 
 ### Rate Limiting Strategy
 
-**Respectful and Adaptive.** A single shared throttle governs *all* wallets in a run:
+**Respectful, adaptive, and time-bounded.** A single shared throttle governs *all*
+wallets in a run:
 
 1. **Normal operation** — 3–6s spacing between requests, which **decays** back toward
    the floor after each success.
-2. **On 429 / 403** — treated identically as "server is pushing back":
-   - **Honor the `Retry-After` header** if the API sends one.
-   - Otherwise exponential backoff from a 60s base (capped at 5 min).
+2. **Pending jobs** — the API answers `{ job: { status: "pending" } }` while it builds
+   a wallet's history. Polling that every few seconds is what gets the IP soft-blocked,
+   so waits step up **20s → 30s → 40s → 50s** (ceiling 60s), then the wallet is skipped.
+3. **On 429 / 403** — treated identically as "server is pushing back":
+   - **Honor the `Retry-After` header** in full. If the server asks for longer than the
+     run can afford, the wallet is **skipped rather than retried early**.
+   - Otherwise exponential backoff from a 60s base, capped at `MAX_COOLDOWN_MS`.
    - Open a **shared cooldown window** so the *next* wallet also waits — this stops the
-     429 → 403 cascade where one rate-limit hit gets the IP soft-blocked for everything.
-   - Widen request spacing for the rest of the run.
-   - Give up a wallet after `MAX_BLOCK_RETRIES` cooldowns (the run keeps going).
-3. **On timeout** — retry up to 5× with 5–10s backoff, then move on.
-4. **One failing wallet never fails the whole run** — it's logged and skipped.
+     429 → 403 cascade where one rate-limit hit soft-blocks the IP for everything.
+   - **Fail fast:** at most 2 retries and 2 minutes of cooldown per wallet, then move on.
+   - **Circuit breaker:** after 2 wallets in a row are blocked, the IP itself is blocked,
+     so the run stops fetching entirely and saves what it has.
+4. **On timeout** — retry up to 5× with 5–10s backoff, then move on.
+5. **One failing wallet never fails the whole run** — it's logged and skipped.
 
 **No bypassing, no tricks — just polite, adaptive throttling that backs off harder the
 more the server pushes back.**
+
+### Global Safety Timeout Guard (no more `Canceled` runs)
+
+GitHub cancels a job when it hits `timeout-minutes`, and **everything in memory is lost**
+— which previously threw away thousands of successfully-fetched rows.
+
+The script now enforces its own deadline *below* the workflow's:
+
+```
+0 ──────────── fetch phase ───────────► 18.5 min ── write ──► 20 min │ … │ 30 min
+                                        ▲                    ▲            ▲
+                    GLOBAL_TIMEOUT_MS − WRITE_RESERVE_MS   guard    workflow timeout
+```
+
+- Every wait (cooldown, pending poll, timeout retry) is checked against the deadline.
+  If a wait wouldn't finish in time, the script **stops instead of sleeping into a
+  cancellation**.
+- When the budget runs out, remaining wallets are abandoned, the rows already fetched
+  are written to Sheets, and the process exits **0** — the run finishes **green with
+  partial data** instead of red/cancelled with nothing.
+- Partial results are protected by `MIN_SUCCESS_RATIO`: if too few wallets succeeded,
+  the destructive clear+write is skipped so a good previous snapshot survives.
+
+### Manual retry mode
+
+Re-fetch a single wallet that was skipped, **appending** without clearing the sheet:
+
+```bash
+node src/index.js 0x1234567890abcdef1234567890abcdef12345678
+```
 
 ### About 429 / 403 — "can I make it look like a real browser, or use another endpoint?"
 
