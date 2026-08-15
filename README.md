@@ -11,6 +11,7 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ✅ **Scales to 200+ Wallets** — Batch split across parallel matrix jobs, one tab each  
 ✅ **Time-Windowed History** — Last 90 days by `time_at`, paginated newest-first  
 ✅ **Fair Rotation** — Starting wallet rotates so a block can't starve the same wallets  
+✅ **Coverage Accumulates** — A blocked wallet keeps its rows; nothing is wiped  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
 ✅ **Rate Limit Aware** — Adaptive throttling + exponential backoff  
 ✅ **429 Handling** — Respects rate limits, retries intelligently  
@@ -122,7 +123,8 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `MAX_RETRIES` — Max attempts per wallet (default: `10`)
 - `MAX_TIMEOUT_RETRIES` — Max retries for timeouts (default: `5`)
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
-- `MIN_SUCCESS_RATIO` — Min share of wallets that must succeed before overwriting the sheet (default: `0.5`)
+- `MERGE_PRESERVE` — Keep rows for wallets not refreshed this run (default: `1`; `0` = destructive full refresh)
+- `MIN_SUCCESS_RATIO` — Only used when `MERGE_PRESERVE=0` (default: `0.5`)
 - `HTTP_USER_AGENT` — Override the request User-Agent (optional)
 
 See `config/example.env` for full template.
@@ -173,7 +175,7 @@ own GitHub Actions matrix job, writing to its **own sheet tab**.
                           │
    ┌──────────┬───────────┼───────────┬──────────┐
    ▼          ▼           ▼           ▼          ▼
- batch 1    batch 2     batch 3    …   batch 10        (max-parallel: 2)
+ batch 1    batch 2     batch 3    …   batch 10        (max-parallel: 1)
    │          │           │           │          │
    ▼          ▼           ▼           ▼          ▼
 Batch_01   Batch_02    Batch_03    …   Batch_10        (one tab each)
@@ -212,14 +214,14 @@ env:
   BATCH_TOTAL: '10'                          # must equal the matrix length
 strategy:
   fail-fast: false                           # one blocked batch ≠ cancel the rest
-  max-parallel: 2                            # be polite to Rabby
+  max-parallel: 1                            # be polite to Rabby
   matrix:
     batch: [1,2,3,4,5,6,7,8,9,10]
 ```
 
 - **More batches** → fewer wallets per job → each job finishes faster
-- **Lower `max-parallel`** → gentler on Rabby's rate limit (2 recommended; raising it
-  is what produced the 403 soft-blocks)
+- **Lower `max-parallel`** → gentler on Rabby's rate limit. A measured run got a
+  429 after 10 requests in 149s (~4 req/min), so `1` is the safe setting.
 - `fail-fast: false` matters: without it, one blocked batch cancels the other nine
 
 Slicing is **deterministic and exact** — 200 wallets over 10 batches gives 20 each;
@@ -232,9 +234,9 @@ the *combined* rate of every batch running at once. Three layers keep it low:
 
 | Layer | Setting |
 |---|---|
-| Fewer jobs at once | `max-parallel: 2` |
+| Fewer jobs at once | `max-parallel: 1` (fully serialised) |
 | Jobs don't start in lockstep | Random 5–15s **stagger** step before the script runs |
-| Requests aren't evenly spaced | Random 5–12s per request, 1.5–2s between pages |
+| Requests aren't evenly spaced | Random 15–30s per request, 1.5–2s between pages |
 
 ### Optional proxy
 
@@ -251,6 +253,28 @@ secret unset to send traffic directly — nothing changes.
 
 > Note: a custom `httpsAgent` makes axios ignore the proxy environment variables,
 > so the agent itself is built as a tunnelling agent when a proxy is configured.
+
+### Coverage accumulates across runs
+
+A single run does **not** have to succeed for every wallet. Each row carries a
+`wallet_address` (column AJ), so a write only replaces rows for the wallets that
+were actually refreshed — everything else is carried over from the sheet.
+
+```
+run 1:  w1-w5 ok, w6-w10 blocked  ->  w1-w5 fresh + w6-w10 preserved
+run 2:  rotation moves the start  ->  different wallets refresh, none lost
+```
+
+Combined with wallet rotation, every wallet's data is refreshed over a few runs
+even while some requests are still being soft-blocked. Before this, a partial run
+cleared the tab and destroyed the rows of every wallet it didn't reach.
+
+A wallet that succeeds with **zero** in-window transactions correctly ends up with
+no rows — that is a real result, not a gap.
+
+> ⚠️ Existing tabs need the `wallet_address` header added in column **AJ**. Rows
+> written before it existed cannot be attributed and are dropped once, then
+> repopulate as their wallets are refreshed. New batch tabs get it automatically.
 
 ### Google Sheets write quota
 

@@ -27,10 +27,12 @@ jobs:
     strategy:
       # One blocked batch must not cancel the others — each writes its own tab.
       fail-fast: false
-      # All runners share GitHub's Azure egress ranges, so the upstream sees the
-      # combined request rate. Two at a time keeps that rate low enough to stay
-      # under the anti-bot threshold that was producing 403s.
-      max-parallel: 2
+      # Measured from a real run: a 429 arrived after only 10 requests in 149s
+      # (~4 req/min), and two parallel jobs double what the upstream sees from
+      # GitHub's shared egress range. Serialising is the only way to stay under
+      # a threshold that low. 10 batches x ~11 min = ~110 min, fine for a
+      # 6-hourly schedule.
+      max-parallel: 1
       matrix:
         batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
@@ -90,10 +92,12 @@ jobs:
           WRITE_RESERVE_MS: '90000'      # keep 90s to flush results to Sheets
 
           # --- Request spacing (adaptive + randomised) ---
-          # Each request waits a random 5-12s; the range is deliberately wide so
-          # the cadence is irregular rather than a fixed, fingerprintable beat.
-          JITTER_MIN_MS: '5000'
-          JITTER_MAX_MS: '12000'
+          # Each request waits a random 15-30s. Sized from the observed block
+          # threshold (~4 req/min): this keeps us at ~2-3 req/min. Every wallet
+          # costs 2 requests because the API answers the first one with a
+          # pending job, so 10 wallets is ~20 requests per batch.
+          JITTER_MIN_MS: '15000'
+          JITTER_MAX_MS: '30000'
           MAX_DELAY_MS: '30000'
 
           # Rotate the starting wallet each run so a mid-batch block cannot
@@ -120,6 +124,9 @@ jobs:
           MAX_RETRIES: '10'
           MAX_TIMEOUT_RETRIES: '5'
           CHUNK_SIZE: '500'
-          MIN_SUCCESS_RATIO: '0.5'
+          # Keep rows for wallets that weren't refreshed this run, so coverage
+          # accumulates across runs instead of a partial run wiping the tab.
+          MERGE_PRESERVE: '1'
+          MIN_SUCCESS_RATIO: '0.5'       # only consulted when MERGE_PRESERVE=0
         run: |
           node src/index.js --batch ${{ matrix.batch }}/${{ github.event.inputs.batches || env.BATCH_TOTAL }}
