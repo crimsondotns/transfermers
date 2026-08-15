@@ -8,7 +8,9 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 
 ## ✨ Features
 
-✅ **Batch Wallet Support** — Track multiple wallets simultaneously  
+✅ **Scales to 200+ Wallets** — Batch split across parallel matrix jobs, one tab each  
+✅ **Full History** — `page_count=2000` per wallet  
+✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
 ✅ **Rate Limit Aware** — Adaptive throttling + exponential backoff  
 ✅ **429 Handling** — Respects rate limits, retries intelligently  
 ✅ **Timeout Recovery** — Auto-retry on network timeouts  
@@ -51,7 +53,14 @@ GOOGLE_CREDENTIALS={"type":"service_account","project_id":"...","private_key":".
 
 ### Step 3: Prepare Google Sheet
 
-Create a new Google Sheet with headers in row 1:
+Create a spreadsheet and share it with the service account email as **Editor**.
+
+> 💡 **Batch tabs are created for you.** When using `--batch` (see
+> [Scaling to 200+ Wallets](#-scaling-to-200-wallets-batches--matrix)), tabs like
+> `Batch_01`…`Batch_10` are created automatically with the correct header row —
+> you only need the spreadsheet itself.
+
+For a single-tab setup, create the tab with headers in row 1:
 
 | A | B | C | D | E | F | ... | AI |
 |---|---|---|---|---|---|-----|-----|
@@ -84,6 +93,12 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 
 **Optional (with sensible defaults):**
 - `GOOGLE_SHEET_NAME` — Sheet tab name (default: `Sheet1`)
+- `WALLETS_FILE` — JSON file of wallets, alternative to `WALLET_LIST`
+- `BATCH_INDEX` / `BATCH_TOTAL` — Batch slice to process (same as `--batch N/TOTAL`)
+- `TARGET_SHEET_NAME` — Force a target tab (same as `--sheet`)
+- `BATCH_SHEET_PREFIX` — Prefix for batch tabs (default: `Batch_`)
+- `PAGE_COUNT` — History depth per wallet (default: `2000` = full window)
+- `SHEETS_WRITE_DELAY_MS` — Pause between Sheets chunk writes (default: `1500`)
 - `LOG_LEVEL` — `INFO` (default) or `DEBUG` for verbose per-request logs
 - `NO_COLOR` — set to disable ANSI colors in logs
 - `GLOBAL_TIMEOUT_MS` — Stop fetching after this long, ms (default: `1200000` = 20 min)
@@ -112,35 +127,102 @@ See `config/example.env` for full template.
 
 ### GitHub Actions (Automated)
 
-The workflow runs **every 15 minutes** automatically. Modify the cron in `.github/workflows/rabby-sync.yml`:
+The workflow runs **every 6 hours**. Modify the cron in `.github/workflows/sync.yml`:
 
 ```yaml
 schedule:
-  - cron: '*/15 * * * *'  # Every 15 minutes
+  - cron: '0 */6 * * *'   # Every 6 hours
   # Other options:
-  # - cron: '0 */6 * * *'   # Every 6 hours
   # - cron: '0 2 * * *'     # Daily at 2 AM UTC
+  # - cron: '*/30 * * * *'  # Every 30 minutes (small wallet lists only)
 ```
 
 Trigger manually:
 1. Go to **Actions** tab
 2. Select **Rabby Transaction Sync** workflow
-3. Click **Run workflow**
+3. Click **Run workflow** (optionally override the batch count)
 
 ### Local Testing
 
 ```bash
-# Install dependencies
 npm install
-
-# Copy example config
-cp config/example.env .env
-
-# Edit .env with your values
-
-# Run sync
+cp config/example.env .env    # then edit .env
 npm start
+
+node src/index.js --help      # all options
 ```
+
+---
+
+## 🧩 Scaling to 200+ Wallets (Batches + Matrix)
+
+Running 200 wallets in one job cannot finish inside the workflow timeout and gets
+the IP soft-blocked. Instead the list is **split into batches**, each handled by its
+own GitHub Actions matrix job, writing to its **own sheet tab**.
+
+```
+        WALLET_LIST secret (200+ wallets, one list)
+                          │
+        split into 10 contiguous, deterministic slices
+                          │
+   ┌──────────┬───────────┼───────────┬──────────┐
+   ▼          ▼           ▼           ▼          ▼
+ batch 1    batch 2     batch 3    …   batch 10        (max-parallel: 3)
+   │          │           │           │          │
+   ▼          ▼           ▼           ▼          ▼
+Batch_01   Batch_02    Batch_03    …   Batch_10        (one tab each)
+```
+
+**Why separate tabs?** Each run does a full refresh (`clear` then write). If every
+job targeted the same tab they would clear each other's rows mid-write — a genuine
+race condition. Per-batch tabs remove the shared resource entirely.
+
+### Running a batch
+
+```bash
+node src/index.js --batch 3/10          # slice 3 of 10 → tab "Batch_03"
+node src/index.js --batch 3/10 --sheet Custom_Tab
+BATCH_INDEX=3 BATCH_TOTAL=10 node src/index.js
+```
+
+Tab name is resolved in this order:
+
+| Priority | Source | Example |
+|---|---|---|
+| 1 | `--sheet` | `--sheet Batch_03` |
+| 2 | `TARGET_SHEET_NAME` | `TARGET_SHEET_NAME=Batch_03` |
+| 3 | Batch-derived | `--batch 3/10` → `Batch_03` |
+| 4 | `GOOGLE_SHEET_NAME` | `Sheet1` |
+
+Tabs are **created automatically** (with a header row) on first use, so you don't
+have to pre-make `Batch_01`…`Batch_10`.
+
+### Tuning the split
+
+In `.github/workflows/sync.yml`, keep these two in sync:
+
+```yaml
+env:
+  BATCH_TOTAL: '10'                          # must equal the matrix length
+strategy:
+  fail-fast: false                           # one blocked batch ≠ cancel the rest
+  max-parallel: 3                            # be polite to Rabby
+  matrix:
+    batch: [1,2,3,4,5,6,7,8,9,10]
+```
+
+- **More batches** → fewer wallets per job → each job finishes faster
+- **Lower `max-parallel`** → gentler on Rabby's rate limit (3–4 recommended)
+- `fail-fast: false` matters: without it, one blocked batch cancels the other nine
+
+Slicing is **deterministic and exact** — 200 wallets over 10 batches gives 20 each;
+205 gives `21,21,21,21,21,20,20,20,20,20`. No wallet is fetched twice or missed.
+
+### Google Sheets write quota
+
+Sheets allows ~60 write requests/minute/user, **shared across all parallel jobs**.
+`SHEETS_WRITE_DELAY_MS` (default `1500`) spaces out chunk writes, and quota errors
+get their own exponential backoff. Raise it if you increase `max-parallel`.
 
 ---
 
@@ -255,6 +337,14 @@ Re-fetch a single wallet that was skipped, **appending** without clearing the sh
 node src/index.js 0x1234567890abcdef1234567890abcdef12345678
 ```
 
+When batching is configured, the script works out which batch that wallet belongs to
+and appends to **that batch's tab** — so a retry can't land in the wrong tab. Override
+explicitly if needed:
+
+```bash
+node src/index.js 0x1234... --sheet Batch_03
+```
+
 ### About 429 / 403 — "can I make it look like a real browser, or use another endpoint?"
 
 Short answer: **don't try to disguise the request** — that's fragile and against the
@@ -328,15 +418,27 @@ spirit of the API's limits. Two honest options actually fix it:
 
 ## 📈 Adding More Wallets
 
-1. Go to GitHub Settings → Secrets
-2. Edit `WALLET_LIST` secret
-3. Add comma-separated addresses:
-   ```
-   0x123...,0xabc...,0xdef...
-   ```
-4. Save — next run will include all wallets
+1. Go to GitHub **Settings → Secrets**
+2. Edit `WALLET_LIST` and append the new addresses (comma-separated)
+3. Save — the next run picks them up
 
-**Performance Note**: Each wallet takes ~10-30 seconds to fetch. With 10 wallets and 15-minute intervals, you should be fine. With 50+ wallets, consider increasing interval to 30 minutes.
+**Keep batches balanced.** The list is split evenly, so adding wallets grows every
+batch a little. Rough guide:
+
+| Wallets | Batches | Wallets/batch | Approx. per job |
+|---|---|---|---|
+| ~50 | 3 | ~17 | 3–8 min |
+| ~100 | 5 | 20 | 4–10 min |
+| ~200 | 10 | 20 | 4–10 min |
+| ~400 | 20 | 20 | 4–10 min |
+
+Aim for **15–20 wallets per batch**. If jobs start hitting the 20-minute guard, add
+more batches rather than raising the timeout.
+
+⚠️ When you change the batch count, update **both** `BATCH_TOTAL` and the `matrix.batch`
+list in `.github/workflows/sync.yml` — they must match. Note that changing the count
+re-shuffles which wallets land in which tab, so old tabs beyond the new count
+(e.g. `Batch_11`+ after going 20 → 10) are left behind and should be deleted manually.
 
 ---
 
