@@ -111,7 +111,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `NO_COLOR` — set to disable ANSI colors in logs
 - `GLOBAL_TIMEOUT_MS` — Stop fetching after this long, ms (default: `1200000` = 20 min)
 - `WRITE_RESERVE_MS` — Time reserved for the Sheets write, ms (default: `90000`)
-- `JITTER_MIN_MS` / `JITTER_MAX_MS` — Random spacing band per request, ms (default: `5000` / `12000`)
+- `JITTER_MIN_MS` / `JITTER_MAX_MS` — Random spacing band per request, ms (default: `4000` / `8000`)
 - `MAX_DELAY_MS` — Ceiling for adaptive spacing, ms (default: `30000`)
 - `PENDING_BASE_MS` / `PENDING_STEP_MS` / `PENDING_MAX_MS` — Pending-job backoff (default: `20000` / `10000` / `60000`)
 - `MAX_PENDING_ROUNDS` — Max pending polls per wallet (default: `4`)
@@ -123,6 +123,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `MAX_RETRIES` — Max attempts per wallet (default: `10`)
 - `MAX_TIMEOUT_RETRIES` — Max retries for timeouts (default: `5`)
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
+- `MAX_REQUESTS_PER_RUN` — Hard cap on API requests per run (default: `8`) — **the key setting**
 - `MERGE_PRESERVE` — Keep rows for wallets not refreshed this run (default: `1`; `0` = destructive full refresh)
 - `MIN_SUCCESS_RATIO` — Only used when `MERGE_PRESERVE=0` (default: `0.5`)
 - `HTTP_USER_AGENT` — Override the request User-Agent (optional)
@@ -226,6 +227,33 @@ strategy:
 
 Slicing is **deterministic and exact** — 200 wallets over 10 batches gives 20 each;
 205 gives `21,21,21,21,21,20,20,20,20,20`. No wallet is fetched twice or missed.
+
+### The block is a request *count* quota, not a rate limit
+
+Two measured runs settle it:
+
+| Run | Requests | Elapsed | Rate | Blocked at |
+|---|---|---|---|---|
+| A | 11 | 149s | 4.4/min | request **11** |
+| B | 10 | 215s | 2.8/min | request **10** |
+
+Pacing differed by 60%; the block arrived at the same *request number*. Slowing
+down therefore cannot help — only sending fewer requests can.
+
+**`MAX_REQUESTS_PER_RUN` (default 8) is the setting that matters.** The run stops
+cleanly when the budget is spent, instead of burning cooldowns on requests that
+are certain to be refused.
+
+Because every matrix job gets a **fresh runner, and therefore a fresh quota**, the
+way to cover more wallets is *more, smaller batches* — not a bigger budget:
+
+```
+98 wallets ÷ 25 batches = ~4 wallets/job × 2 requests = 8 requests   ✓ under quota
+98 wallets ÷ 10 batches = ~10 wallets/job × 2 requests = 20 requests ✗ blocked at 10
+```
+
+Each wallet costs **2** requests because the API answers the first one with a
+pending job and we have to poll for the result.
 
 ### Keeping parallel jobs off the rate limiter
 

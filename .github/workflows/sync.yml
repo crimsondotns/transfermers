@@ -13,9 +13,11 @@ on:
         default: '10'
 
 env:
-  # Number of matrix slices. MUST match the length of the matrix.batch list below —
-  # the script splits the wallet list into exactly this many contiguous slices.
-  BATCH_TOTAL: '10'
+  # Number of matrix slices. MUST match the length of the matrix.batch list below.
+  # Sized from the upstream quota, not from wallet count: the API blocks at about
+  # 10 requests per IP and each wallet costs 2 requests, so a job can safely do
+  # ~4 wallets. 98 wallets / 25 batches = ~4 each.
+  BATCH_TOTAL: '25'
 
 jobs:
   sync:
@@ -27,14 +29,14 @@ jobs:
     strategy:
       # One blocked batch must not cancel the others — each writes its own tab.
       fail-fast: false
-      # Measured from a real run: a 429 arrived after only 10 requests in 149s
-      # (~4 req/min), and two parallel jobs double what the upstream sees from
-      # GitHub's shared egress range. Serialising is the only way to stay under
-      # a threshold that low. 10 batches x ~11 min = ~110 min, fine for a
-      # 6-hourly schedule.
+      # Each job gets a fresh runner, and therefore a fresh request quota, which
+      # is why splitting into more, smaller jobs works where slowing down did not.
+      # Kept at 1 so the jobs do not share an egress window.
       max-parallel: 1
       matrix:
-        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                21, 22, 23, 24, 25]
 
     name: batch ${{ matrix.batch }}
 
@@ -51,9 +53,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Even with max-parallel 2, concurrent jobs finish `npm ci` at almost the
-      # same moment and would then hit the API in lockstep. A random offset
-      # de-synchronises them before the first request goes out.
+      # Small random offset so consecutive jobs do not start on an exact cadence.
       - name: Stagger start
         run: |
           DELAY=$(( (RANDOM % 11) + 5 ))   # 5-15 seconds
@@ -92,13 +92,17 @@ jobs:
           WRITE_RESERVE_MS: '90000'      # keep 90s to flush results to Sheets
 
           # --- Request spacing (adaptive + randomised) ---
-          # Each request waits a random 15-30s. Sized from the observed block
-          # threshold (~4 req/min): this keeps us at ~2-3 req/min. Every wallet
-          # costs 2 requests because the API answers the first one with a
-          # pending job, so 10 wallets is ~20 requests per batch.
-          JITTER_MIN_MS: '15000'
-          JITTER_MAX_MS: '30000'
+          # Two runs proved the block is a request COUNT quota, not a rate: 11
+          # requests over 149s and 10 over 215s both tripped it at the same
+          # request number. Spacing therefore buys nothing, so it is back to a
+          # polite-but-not-pointless 4-8s. MAX_REQUESTS_PER_RUN is the real guard.
+          JITTER_MIN_MS: '4000'
+          JITTER_MAX_MS: '8000'
           MAX_DELAY_MS: '30000'
+
+          # Hard stop before the upstream starts refusing us. 4 wallets x 2
+          # requests = 8, just under the observed ~10 threshold.
+          MAX_REQUESTS_PER_RUN: '8'
 
           # Rotate the starting wallet each run so a mid-batch block cannot
           # starve the same later wallets on every single run.
