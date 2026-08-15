@@ -61,8 +61,13 @@ jobs:
           BATCH_SHEET_PREFIX: 'Batch_'
           SHEETS_WRITE_DELAY_MS: '1500'  # shared ~60 writes/min quota across runners
 
-          # --- History depth ---
-          PAGE_COUNT: '2000'             # full history window per wallet
+          # --- History depth & pagination ---
+          # One request cannot return 2000 rows, so the script pages through with
+          # a start_time cursor until it has PAGE_COUNT rows per wallet.
+          PAGE_COUNT: '2000'             # total rows per wallet (target)
+          PAGE_SIZE: '200'               # rows per API request
+          MAX_PAGES_PER_WALLET: '20'     # anti-runaway cap
+          PAGE_DELAY_MS: '500'           # spacing between pages of one wallet
 
           LOG_LEVEL: 'INFO'
 

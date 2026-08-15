@@ -9,7 +9,7 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ## ✨ Features
 
 ✅ **Scales to 200+ Wallets** — Batch split across parallel matrix jobs, one tab each  
-✅ **Full History** — `page_count=2000` per wallet  
+✅ **Full History** — Paginated with a `start_time` cursor, newest-first  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
 ✅ **Rate Limit Aware** — Adaptive throttling + exponential backoff  
 ✅ **429 Handling** — Respects rate limits, retries intelligently  
@@ -97,7 +97,10 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `BATCH_INDEX` / `BATCH_TOTAL` — Batch slice to process (same as `--batch N/TOTAL`)
 - `TARGET_SHEET_NAME` — Force a target tab (same as `--sheet`)
 - `BATCH_SHEET_PREFIX` — Prefix for batch tabs (default: `Batch_`)
-- `PAGE_COUNT` — History depth per wallet (default: `2000` = full window)
+- `PAGE_COUNT` — Total transactions to collect per wallet (default: `2000`)
+- `PAGE_SIZE` — Rows per API request (default: `200`)
+- `MAX_PAGES_PER_WALLET` — Anti-runaway page cap (default: `20`)
+- `PAGE_DELAY_MS` — Spacing between pages of one wallet (default: `500`)
 - `SHEETS_WRITE_DELAY_MS` — Pause between Sheets chunk writes (default: `1500`)
 - `LOG_LEVEL` — `INFO` (default) or `DEBUG` for verbose per-request logs
 - `NO_COLOR` — set to disable ANSI colors in logs
@@ -281,6 +284,42 @@ get their own exponential backoff. Raise it if you increase `max-parallel`.
 │  Done ✅                                         │
 └─────────────────────────────────────────────────┘
 ```
+
+### Pagination — how full history is actually retrieved
+
+`page_count=2000` in a **single** request does not return 2000 rows: the API caps
+each response, so the history was silently truncated and the most recent
+transactions never reached the sheet.
+
+The script now walks backwards through time:
+
+```
+page 1:  GET ?id=0x…&page_count=200                  → newest 200 rows
+page 2:  GET ?id=0x…&page_count=200&start_time=<oldest time_at so far>
+page 3:  … repeat until PAGE_COUNT rows or history runs out
+```
+
+Rows are de-duplicated by transaction id (pages can overlap) and the whole batch
+is **sorted newest-first** before being written, so row 2 of the sheet is always
+the most recent transaction.
+
+**The loop cannot run away** — it stops on any of:
+
+| # | Guard |
+|---|---|
+| 1 | `MAX_PAGES_PER_WALLET` hard cap (default 20) |
+| 2 | A page comes back empty |
+| 3 | A page is shorter than `PAGE_SIZE` (last page) |
+| 4 | A page contains no new transaction ids (API ignored the cursor) |
+| 5 | The cursor stops moving backwards in time |
+| 6 | `PAGE_COUNT` rows collected |
+| 7 | The global deadline — checked inside every page request |
+
+Pages of the same wallet are spaced `PAGE_DELAY_MS` (500ms) apart, **but the
+adaptive delay takes over the moment a 429/403 appears**, so pagination can never
+out-run the throttle the server asked for. The per-wallet block budget is shared
+across all of a wallet's pages, so a blocked wallet still costs at most ~2 minutes
+in total — not 2 minutes per page.
 
 ### Rate Limiting Strategy
 
