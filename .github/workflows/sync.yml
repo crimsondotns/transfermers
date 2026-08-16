@@ -132,9 +132,9 @@ jobs:
           MAX_RETRIES: '10'
           MAX_TIMEOUT_RETRIES: '5'
           CHUNK_SIZE: '500'
-          # Keep rows for wallets that weren't refreshed this run, so coverage
-          # accumulates across runs instead of a partial run wiping the tab.
-          MERGE_PRESERVE: '1'
-          MIN_SUCCESS_RATIO: '0.5'       # only consulted when MERGE_PRESERVE=0
+          # The tab is a full refresh and rows carry no wallet identity, so a
+          # partial run would drop the missing wallets' history. 1 = only rewrite
+          # when the whole batch succeeded; otherwise keep the previous snapshot.
+          MIN_SUCCESS_RATIO: '1'
         run: |
           node src/index.js --batch ${{ matrix.batch }}/${{ env.BATCH_TOTAL }}

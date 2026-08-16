@@ -89,7 +89,6 @@ Key environment variables:
   BATCH_SHEET_PREFIX       Prefix for batch tabs (default: Batch_)
   HISTORY_DAYS             Look-back window in days, by time_at (default: 180; 0 = off)
   ROTATION_PERIOD_MS       Rotate the starting wallet each run (default: 3600000)
-  MERGE_PRESERVE           Keep rows for wallets not refreshed this run (default: 1)
   MAX_REQUESTS_PER_RUN     Hard cap on API requests per run (default: 8)
   PAGE_COUNT               Safety ceiling on rows per wallet (default: 2000)
   PAGE_SIZE                Rows per API request (default: 200)
@@ -283,10 +282,6 @@ const RATE_LIMIT_CONFIG = {
     Math.round(num('PAGE_DELAY_MIN_MS', num('PAGE_DELAY_MS', 1500)) * 4 / 3)),
 
   // --- Google Sheets ---
-  // Keep rows for wallets that weren't refreshed this run instead of clearing
-  // them. This is what lets coverage accumulate across runs even when some
-  // wallets get soft-blocked. Set to 0 for the old destructive full refresh.
-  MERGE_PRESERVE: num('MERGE_PRESERVE', 1) !== 0,
   CHUNK_SIZE: num('CHUNK_SIZE', 500),
   // Pause between chunk writes. Google allows ~60 write requests/minute/user and
   // that quota is shared by every parallel matrix job, so this defaults high
@@ -295,7 +290,10 @@ const RATE_LIMIT_CONFIG = {
   // Safety guard: the sheet is a full-refresh snapshot, so writing a mostly-empty
   // result would destroy a good previous snapshot. Require this share of wallets
   // to have succeeded before the destructive clear+write is allowed.
-  MIN_SUCCESS_RATIO: parseFloat(process.env.MIN_SUCCESS_RATIO || '0.5'),
+  // Share of a batch that must succeed before the tab is rewritten. With small
+  // batches and no per-wallet identity in the sheet, 1.0 (the whole batch) is the
+  // only value that cannot silently drop a wallet's history.
+  MIN_SUCCESS_RATIO: parseFloat(process.env.MIN_SUCCESS_RATIO || '1'),
 };
 
 // Honest client headers — we identify as a normal HTTP/JSON client and rely on
@@ -1018,8 +1016,7 @@ function mapTransactionToRow(tx, walletAddr) {
       tx_label, tx_eth_gas_fee, tx_from_addr, tx_id, tx_idx,
       tx_message, tx_name, tx_params, tx_selector, tx_status, tx_to_addr,
       tx_usd_gas_fee, tx_value,
-      null,        // [34] recorded_at — filled during write
-      walletAddr,  // [35] wallet_address — lets the writer merge per wallet
+      null, // [34] recorded_at — filled during write
     ];
   } catch (err) {
     log('ERROR', `Mapping failed for wallet ${maskAddr(walletAddr)}: ${err.message}`);
@@ -1084,10 +1081,6 @@ const SHEET_HEADER = [
   'tx_label', 'tx_eth_gas_fee', 'tx_from_addr', 'tx_id', 'tx_idx',
   'tx_message', 'tx_name', 'tx_params', 'tx_selector', 'tx_status', 'tx_to_addr',
   'tx_usd_gas_fee', 'tx_value', 'recorded_at',
-  // Appended last (column AJ) so all 35 existing columns keep their positions.
-  // Without it, rows cannot be attributed to a wallet, which is why a skipped
-  // wallet's history used to be wiped instead of preserved.
-  'wallet_address',
 ];
 
 /** Look up a tab's sheetId + current grid size, or null when it doesn't exist. */
@@ -1111,40 +1104,7 @@ async function ensureSheetTab(sheets, sheetName) {
   const existing = await withRetry(
     () => findSheetProps(sheets, sheetName), `Look up tab "${sheetName}"`);
 
-  if (existing) {
-    // Tabs created before wallet_address existed have only 35 columns, and a
-    // 36-wide write into them fails with "exceeds grid limits". Widen the grid
-    // and refresh the header so no manual spreadsheet edit is ever needed.
-    const cols = existing.gridProperties?.columnCount || 0;
-    if (cols < SHEET_HEADER.length) {
-      log('INFO', `Widening "${sheetName}" from ${cols} to ${SHEET_HEADER.length} columns`);
-      await withRetry(() => sheets.spreadsheets.batchUpdate({
-        spreadsheetId: GOOGLE_SPREADSHEET_ID,
-        resource: {
-          requests: [{
-            updateSheetProperties: {
-              properties: {
-                sheetId: existing.sheetId,
-                gridProperties: { columnCount: SHEET_HEADER.length },
-              },
-              fields: 'gridProperties.columnCount',
-            },
-          }],
-        },
-      }), `Widen tab "${sheetName}"`);
-
-      await withRetry(() => sheets.spreadsheets.values.update({
-        spreadsheetId: GOOGLE_SPREADSHEET_ID,
-        range: `${sheetName}!A1`,
-        valueInputOption: 'RAW',
-        resource: { values: [SHEET_HEADER] },
-      }), `Write header row in "${sheetName}"`);
-      log('OK', `"${sheetName}" migrated — wallet_address header added automatically`);
-
-      existing.gridProperties.columnCount = SHEET_HEADER.length;
-    }
-    return existing;
-  }
+  if (existing) return existing;
 
   log('INFO', `Tab "${sheetName}" not found — creating it`);
   try {
@@ -1193,16 +1153,8 @@ async function ensureSheetTab(sheets, sheetName) {
  * `sheetName` scopes every operation — clear, write and trim — to one tab, so
  * parallel matrix jobs writing different batches never touch each other's rows.
  */
-async function writeToSheet(rows, sheetName, refreshedWallets) {
-  // `refreshedWallets` = wallets successfully fetched this run. Rows belonging to
-  // any OTHER wallet are carried over from the sheet, so a wallet that was
-  // blocked or skipped keeps the history it already had instead of being wiped.
-  // A wallet that succeeded with zero in-window rows correctly ends up with none.
-  const refreshed = refreshedWallets instanceof Set
-    ? refreshedWallets
-    : new Set(refreshedWallets || []);
-
-  if (rows.length === 0 && refreshed.size === 0) {
+async function writeToSheet(rows, sheetName) {
+  if (rows.length === 0) {
     log('WARN', `Nothing fetched — leaving "${sheetName}" untouched (safe-guard)`);
     return 0;
   }
@@ -1216,42 +1168,12 @@ async function writeToSheet(rows, sheetName, refreshedWallets) {
   const sheetId = props.sheetId;
   const currentRowCount = props.gridProperties?.rowCount || 1000;
 
-  // Stamp recorded_at (column AI / index 34) on every fresh row.
+  // Stamp recorded_at (column AI / index 34) on every row, then sort newest-first.
   const recordedAt = getCurrentTimestampTH();
-  const fresh = rows.map((row) => {
+  const values = rows.map((row) => {
     row[34] = recordedAt;
     return row;
   });
-
-  // Carry over rows for wallets this run did NOT refresh.
-  let carried = [];
-  if (RATE_LIMIT_CONFIG.MERGE_PRESERVE) {
-    const existing = await withRetry(() => sheets.spreadsheets.values.get({
-      spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: `${sheetName}!A2:AJ`,
-    }), `Read existing rows from "${sheetName}"`);
-
-    const prior = existing.data.values || [];
-    let unattributed = 0;
-    for (const row of prior) {
-      const owner = (row[35] || '').trim().toLowerCase();
-      if (!owner) { unattributed++; continue; } // pre-migration row: cannot attribute
-      if (!refreshed.has(owner)) carried.push(row);
-    }
-    if (unattributed) {
-      log('WARN', `Dropped ${unattributed} legacy row(s) with no wallet_address ` +
-        `(one-off migration — they will come back as their wallets are refreshed)`);
-    }
-    if (carried.length) {
-      const owners = new Set(carried.map((r) => r[35]));
-      log('INFO', `Preserving ${c.bold(carried.length)} row(s) from ${owners.size} ` +
-        `wallet(s) not refreshed this run`);
-    }
-  }
-
-  // Merge, then sort newest-first (time_at is column Q / index 16, a display
-  // string, so sort on the parsed date to keep ordering correct).
-  const values = [...fresh, ...carried].sort((a, b) => parseDateTH(b[16]) - parseDateTH(a[16]));
 
   if (values.length === 0) {
     log('WARN', `Nothing to write to "${sheetName}" after merge — leaving it untouched`);
@@ -1279,7 +1201,7 @@ async function writeToSheet(rows, sheetName, refreshedWallets) {
   // 2) Clear old values under the header.
   await withRetry(() => sheets.spreadsheets.values.clear({
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
-    range: `${sheetName}!A2:AJ`,
+    range: `${sheetName}!A2:AI`,
   }), `Clear tab "${sheetName}"`);
   log('OK', `Cleared previous values in "${sheetName}" (A2:AI)`);
 
@@ -1331,8 +1253,7 @@ async function writeToSheet(rows, sheetName, refreshedWallets) {
     log('OK', `Trimmed grid ${rowCountNow} → ${targetRowCount} rows (reclaimed cells)`);
   }
 
-  log('OK', `Successfully wrote ${c.bold(values.length)} rows to "${sheetName}"` +
-    (carried.length ? ` (${fresh.length} fresh + ${carried.length} preserved)` : ''));
+  log('OK', `Successfully wrote ${c.bold(values.length)} rows to "${sheetName}"`);
   return values.length;
 }
 
@@ -1371,7 +1292,7 @@ async function appendToSheet(rows, sheetName) {
 
     await withRetry(() => sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: `${sheetName}!A2:AJ`,
+      range: `${sheetName}!A2:AI`,
       valueInputOption: 'RAW',
       resource: { values: chunk },
     }), `Append chunk ${chunkNum}/${totalChunks}`);
@@ -1437,7 +1358,6 @@ async function processTransactions() {
   let errorCount = 0;
 
   let okCount = 0;
-  const refreshedWallets = new Set(); // wallets whose rows are authoritative this run
   let consecutiveBlocked = 0; // feeds the circuit breaker
   let processed = 0;
   let stopReason = null;      // set when we abandon the fetch phase early
@@ -1499,9 +1419,6 @@ async function processTransactions() {
       totalFiltered += filtered.length;
       totalScam += scamDropped;
       okCount++;
-      // Recorded even when the wallet had zero in-window rows: that is a real
-      // result and must replace its old rows, not preserve them.
-      refreshedWallets.add(addr);
       consecutiveBlocked = 0; // a success clears the breaker
 
       for (const tx of filtered) {
@@ -1560,20 +1477,19 @@ async function processTransactions() {
       `${c.cyan(formatDateTH(collected[0].timeAt))} → ${c.cyan(formatDateTH(collected[collected.length - 1].timeAt))}`);
   }
 
-  // With merge-preserve on, a partial run is safe: unrefreshed wallets keep their
-  // rows, so writing is strictly better than skipping. The ratio guard is only
-  // needed for the old destructive full-refresh mode.
+  // The write is a full refresh of the tab and rows carry no wallet identity, so
+  // a partial run would silently drop the missing wallets' history. Only rewrite
+  // when enough of the batch succeeded; otherwise keep the previous snapshot.
   const successRatio = wallets.length ? okCount / wallets.length : 0;
-  if (!RATE_LIMIT_CONFIG.MERGE_PRESERVE &&
-      okCount > 0 && successRatio < RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO) {
+  if (okCount > 0 && successRatio < RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO) {
     log('WARN', `${c.bold('Sheet NOT updated')} — only ${okCount}/${wallets.length} wallets succeeded ` +
-      `(below MIN_SUCCESS_RATIO ${RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO}, merge disabled). ` +
-      `Tab "${sheetName}" preserved.`);
+      `(below MIN_SUCCESS_RATIO ${RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO}). ` +
+      `Tab "${sheetName}" keeps its previous contents.`);
     return { success: true, totalRaw, totalFiltered, written: 0, okCount, errorCount,
       skipped, stopReason, sheetName, batch };
   }
 
-  const written = await writeToSheet(allRows, sheetName, refreshedWallets);
+  const written = await writeToSheet(allRows, sheetName);
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   log('OK', `${c.bold('Sync completed')} in ${elapsed}s — ${written} rows written to "${sheetName}"`);
