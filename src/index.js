@@ -1116,6 +1116,11 @@ function mapTransactionToRow(tx, walletAddr, transferIdx = 0, raw = undefined) {
       transferIdx,                                     // [35] transfer_idx
       raw === undefined ? rawCell(tx) : raw,           // [36] raw
       null, // [37] suspect — filled by flagSuspectRows, which needs the whole batch
+      // [38] wallet_address — which of YOUR wallets this row was fetched for.
+      // It cannot be recovered from the data: on a `receive`, other_addr,
+      // tx.from_addr and receives[].from_addr are all the SENDER, and tx.to_addr
+      // is the token contract. The receiving wallet appears nowhere at all.
+      walletAddr ? String(walletAddr).toLowerCase() : null,
     ];
   } catch (err) {
     log('ERROR', `Mapping failed for wallet ${maskAddr(walletAddr)}: ${err.message}`);
@@ -1180,7 +1185,7 @@ const SHEET_HEADER = [
   'tx_label', 'tx_eth_gas_fee', 'tx_from_addr', 'tx_id', 'tx_idx',
   'tx_message', 'tx_name', 'tx_params', 'tx_selector', 'tx_status', 'tx_to_addr',
   'tx_usd_gas_fee', 'tx_value', 'recorded_at',
-  'transfer_idx', 'raw', 'suspect',
+  'transfer_idx', 'raw', 'suspect', 'wallet_address',
 ];
 
 // Last column letter of the header, used in every A1 range below so the ranges
@@ -1197,9 +1202,14 @@ const LAST_COL = (() => {
 })();
 const DATA_RANGE = `A2:${LAST_COL}`;
 
-/** True when a row carries the `raw` column, i.e. it was written by this version. */
+/** True when a row carries the `raw` column. */
 function hasRaw(row) {
   return row[36] != null && String(row[36]) !== '';
+}
+
+/** True when a row also carries `wallet_address`, i.e. it is current. */
+function hasWallet(row) {
+  return row[38] != null && String(row[38]) !== '';
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,17 +1325,33 @@ function dropSuspectRows(rows) {
 }
 
 /**
- * Merge key for a sheet row.
+ * Merge key for a sheet row: the wallet it was fetched for, the digest of the
+ * raw API object, and which transfer within it.
  *
- * `raw` is the API object verbatim, so its digest separates any two rows the API
- * itself considers different — including the payer's and the payee's view of one
- * transfer, which share a transaction id. `transfer_idx` separates the sibling
- * rows that one multi-token transaction expands into, since those do share a
- * source object. Re-fetching a wallet reproduces both parts exactly, so its rows
- * are replaced rather than duplicated.
+ * Each part answers a different collision:
+ *   wallet_address  a row is "this transfer, as seen from this wallet" — and the
+ *                   wallet is not derivable from the payload, so it has to be
+ *                   part of the identity rather than computed from it
+ *   raw digest      separates any two rows the API itself considers different,
+ *                   including the payer's and the payee's view of one transfer,
+ *                   which share a transaction id
+ *   transfer_idx    separates the sibling rows one multi-token transaction
+ *                   expands into, since those do share a source object
+ *
+ * Re-fetching a wallet reproduces all three exactly, so its rows are replaced in
+ * place rather than duplicated.
  */
 function keyOf(row) {
   if (!hasRaw(row)) return legacyKeyOf(row);
+  if (!hasWallet(row)) return walletlessKeyOf(row);
+  return `${walletlessKeyOf(row)}@${String(row[38]).toLowerCase()}`;
+}
+
+/**
+ * The key used before `wallet_address` existed. Kept so rows written by the
+ * previous version can be recognised and replaced during the migration.
+ */
+function walletlessKeyOf(row) {
   return `h:${rawDigest(row[36])}#${row[35] ?? 0}`;
 }
 
@@ -1502,25 +1528,33 @@ async function writeToSheet(rows, sheetName) {
   // keep their rows because their keys are not in the fresh set, and rows that
   // aged out of the look-back window are dropped so the tab cannot grow forever.
   //
-  // The key is the digest of the `raw` column plus `transfer_idx`. Guessing which
-  // flat fields make a row unique has now failed twice — first on the transaction
-  // id alone (which collapsed the payer's and the payee's view of one transfer),
+  // See keyOf: wallet_address + digest of `raw` + transfer_idx. Guessing which
+  // flat fields make a row unique failed twice — first on the transaction id
+  // alone (which collapsed the payer's and the payee's view of one transfer),
   // then on a hand-picked set of direction fields (which still could not separate
-  // two identical-amount transfers). The raw JSON is the API's own answer to that
-  // question: two rows differ exactly when their source objects differ, and
-  // transfer_idx separates the sibling rows that share one source object.
+  // two identical-amount transfers) — so the key now comes from the API's own
+  // bytes plus the two things those bytes cannot express.
   const merged = new Map(fresh.map((row) => [keyOf(row), row]));
   let carried = 0;
   let expired = 0;
   let superseded = 0;
 
-  // Rows written before the `raw` column existed cannot be keyed that way, so
-  // they keep the old composite key and are matched against the equivalent key
-  // built from each fresh row. A legacy row whose key a fresh row claims has
-  // been re-fetched and is dropped; the rest are carried over untouched. Without
-  // this the two key spaces would never intersect and the first run after the
-  // upgrade would write every row twice.
-  const claimedLegacy = new Set(fresh.map(legacyKeyOf));
+  // Rows written by an older version key differently, so their key space would
+  // never intersect the fresh one and the first run after an upgrade would write
+  // every row twice. Each fresh row therefore also claims the keys it WOULD have
+  // had under each earlier scheme; an older row whose key is claimed has been
+  // re-fetched and is dropped, and the rest are carried over untouched.
+  const claimedOlder = new Set();
+  for (const row of fresh) {
+    claimedOlder.add(legacyKeyOf(row));    // before `raw` existed
+    claimedOlder.add(walletlessKeyOf(row)); // before `wallet_address` existed
+  }
+  /** The key an existing row is stored under, if it predates the current scheme. */
+  const olderKeyOf = (row) => {
+    if (!hasRaw(row)) return legacyKeyOf(row);
+    if (!hasWallet(row)) return walletlessKeyOf(row);
+    return null; // current scheme — matched by keyOf directly
+  };
 
   const cutoffMs = RATE_LIMIT_CONFIG.HISTORY_DAYS > 0
     ? Date.now() - RATE_LIMIT_CONFIG.HISTORY_DAYS * 86400000
@@ -1534,8 +1568,9 @@ async function writeToSheet(rows, sheetName) {
   for (const row of existing.data.values || []) {
     const key = keyOf(row);
     if (merged.has(key)) continue;                       // refreshed this run
-    if (!hasRaw(row) && claimedLegacy.has(legacyKeyOf(row))) {
-      superseded++;                                      // legacy row, re-fetched
+    const older = olderKeyOf(row);
+    if (older !== null && claimedOlder.has(older)) {
+      superseded++;                                      // older-format row, re-fetched
       continue;
     }
     if (cutoffMs && parseDateTH(row[16]) < cutoffMs) {    // outside the window now
@@ -1549,7 +1584,7 @@ async function writeToSheet(rows, sheetName) {
   if (carried || expired || superseded) {
     log('INFO', `Merged with "${sheetName}": ${c.bold(fresh.length)} fetched, ` +
       `${c.bold(carried)} kept from previous runs` +
-      (superseded ? `, ${superseded} pre-raw row(s) superseded` : '') +
+      (superseded ? `, ${superseded} older-format row(s) superseded` : '') +
       (expired ? `, ${expired} aged out of the window` : ''));
   }
 
@@ -2101,6 +2136,8 @@ module.exports = {
   keyOf,
   legacyKeyOf,
   hasRaw,
+  hasWallet,
+  walletlessKeyOf,
   rawDigest,
   rowUsdValue,
   isDustRelayed,

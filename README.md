@@ -63,11 +63,11 @@ Create a spreadsheet and share it with the service account email as **Editor**.
 
 For a single-tab setup, create the tab with headers in row 1:
 
-| A | B | C | D | E | F | ... | AI | AJ | AK | AL |
-|---|---|---|---|---|---|-----|-----|-----|-----|-----|
-| cate_id | cex_id | chain | id | idx | is_scam | ... | recorded_at | transfer_idx | raw | suspect |
+| A | B | C | D | E | F | ... | AI | AJ | AK | AL | AM |
+|---|---|---|---|---|---|-----|-----|-----|-----|-----|-----|
+| cate_id | cex_id | chain | id | idx | is_scam | ... | recorded_at | transfer_idx | raw | suspect | wallet_address |
 
-**Or use the provided header template** (38 columns A:AL):
+**Or use the provided header template** (39 columns A:AM):
 
 ```
 cate_id | cex_id | chain | id | idx | is_scam | other_addr | project_id | 
@@ -76,7 +76,7 @@ send_amount | send_price | send_to_addr | send_token_id |
 time_at | approve_label | approve_spender | approve_token_id | approve_value | 
 tx_label | tx_eth_gas_fee | tx_from_addr | tx_id | tx_idx | 
 tx_message | tx_name | tx_params | tx_selector | tx_status | tx_to_addr | 
-tx_usd_gas_fee | tx_value | recorded_at | transfer_idx | raw | suspect
+tx_usd_gas_fee | tx_value | recorded_at | transfer_idx | raw | suspect | wallet_address
 ```
 
 > **Upgrading an existing sheet?** Nothing to do. A tab narrower than the header
@@ -344,7 +344,7 @@ request it has. What it *did* fetch is still saved:
 2. **Merge** them with the fresh rows. Wallets this run never reached keep their
    rows because their keys aren't in the fresh set. Rows older than `HISTORY_DAYS`
    are pruned so the tab can't grow forever.
-3. **ClearContent** — wipe `A2:AL`
+3. **ClearContent** — wipe `A2:AM`
 4. **Write** the merged set, newest first
 
 **The merge key is the digest of the `raw` column plus `transfer_idx`** — not the
@@ -359,10 +359,19 @@ become several rows:
 | A reward claim of 3 tokens | 3 | One entry whose `receives` array holds 3 elements |
 | A swap | 1 | One entry with a `sends` and a `receives` element, shown side by side |
 
-`raw` is the API object verbatim, so two rows differ exactly when their sources
-differ, and `transfer_idx` separates the sibling rows that share one source
-object. Re-fetching a wallet reproduces both parts exactly, so its rows are
-replaced in place rather than duplicated.
+The key has three parts, each answering a different collision:
+
+- **`wallet_address`** — a row is *this transfer, as seen from this wallet*, and
+  the wallet is not in the payload at all, so it has to be part of the identity
+  rather than computed from it. Two wallets receiving the identical amount in one
+  transaction produce byte-identical objects that would otherwise collide.
+- **digest of `raw`** — the API object verbatim, so two rows differ exactly when
+  their sources differ.
+- **`transfer_idx`** — separates the sibling rows that share one source object.
+
+Re-fetching a wallet reproduces all three exactly, so its rows are replaced in
+place rather than duplicated. Rows written by earlier versions are recognised by
+the key they *would* have had and superseded, so an upgrade never doubles a tab.
 
 A wallet that runs out of quota *mid-pagination* keeps the pages it already
 fetched, rather than discarding requests that were already spent.
@@ -414,7 +423,7 @@ get their own exponential backoff. Raise it if you increase `max-parallel`.
               │
               ▼
      ┌────────────────────────────────────┐
-     │ Map to 38-column row format        │
+     │ Map to 39-column row format        │
      │ one row per transfer in the tx     │
      └────────┬─────────────────────────────┘
               │
@@ -706,7 +715,7 @@ re-shuffles which wallets land in which tab, so old tabs beyond the new count
 
 ## 📝 Output Format
 
-Each **transfer** becomes one row with 38 columns. A transaction that moves a
+Each **transfer** becomes one row with 39 columns. A transaction that moves a
 single token is one row, as before; one that moves several becomes one row per
 token, because `receives` and `sends` are arrays and reading only element `[0]`
 used to discard the rest.
@@ -724,6 +733,15 @@ used to discard the rest.
 | AJ | transfer_idx | `0` |
 | AK | raw | `{"cate_id":"send",...}` |
 | AL | suspect | `dust_relayed+lookalike` |
+| AM | wallet_address | `0xaaa1111…1111` |
+
+**`wallet_address` (column AM) cannot be derived from the payload** — it has to be
+recorded at fetch time. On a `receive`, `other_addr`, `tx.from_addr` and
+`receives[].from_addr` are all the *sender*, and `tx.to_addr` is the token
+contract; `receives[]` has no `to_addr` at all. The wallet that received the
+money appears nowhere in the response, so without this column a row cannot be
+attributed to one of your wallets — and two wallets receiving the identical
+amount in one transaction produce byte-identical objects that would collide.
 
 **`cate_id` is often empty** — Rabby only sets it for the send/receive/approve/
 cancel shapes. A contract call arrives with `cate_id: null`, so those rows have a
