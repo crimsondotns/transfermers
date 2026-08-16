@@ -9,7 +9,7 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ## ✨ Features
 
 ✅ **Scales to 200+ Wallets** — Batch split across parallel matrix jobs, one tab each  
-✅ **Time-Windowed History** — Last 90 days by `time_at`, paginated newest-first  
+✅ **Time-Windowed History** — Last 180 days by `time_at`, paginated newest-first  
 ✅ **Fair Rotation** — Starting wallet rotates so a block can't starve the same wallets  
 ✅ **Coverage Accumulates** — A blocked wallet keeps its rows; nothing is wiped  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
@@ -99,7 +99,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `BATCH_INDEX` / `BATCH_TOTAL` — Batch slice to process (same as `--batch N/TOTAL`)
 - `TARGET_SHEET_NAME` — Force a target tab (same as `--sheet`)
 - `BATCH_SHEET_PREFIX` — Prefix for batch tabs (default: `Batch_`)
-- `HISTORY_DAYS` — Look-back window in days, by `time_at` (default: `90`; `0` = by row count only)
+- `HISTORY_DAYS` — Look-back window in days, by `time_at` (default: `180`; `0` = by row count only)
 - `ROTATION_PERIOD_MS` — Rotate the starting wallet each run (default: `3600000`; `0` disables)
 - `PAGE_COUNT` — Safety ceiling on rows per wallet (default: `2000`)
 - `PAGE_SIZE` — Rows per API request (default: `200`)
@@ -111,7 +111,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `NO_COLOR` — set to disable ANSI colors in logs
 - `GLOBAL_TIMEOUT_MS` — Stop fetching after this long, ms (default: `1200000` = 20 min)
 - `WRITE_RESERVE_MS` — Time reserved for the Sheets write, ms (default: `90000`)
-- `JITTER_MIN_MS` / `JITTER_MAX_MS` — Random spacing band per request, ms (default: `5000` / `12000`)
+- `JITTER_MIN_MS` / `JITTER_MAX_MS` — Random spacing band per request, ms (default: `4000` / `8000`)
 - `MAX_DELAY_MS` — Ceiling for adaptive spacing, ms (default: `30000`)
 - `PENDING_BASE_MS` / `PENDING_STEP_MS` / `PENDING_MAX_MS` — Pending-job backoff (default: `20000` / `10000` / `60000`)
 - `MAX_PENDING_ROUNDS` — Max pending polls per wallet (default: `4`)
@@ -123,6 +123,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `MAX_RETRIES` — Max attempts per wallet (default: `10`)
 - `MAX_TIMEOUT_RETRIES` — Max retries for timeouts (default: `5`)
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
+- `MAX_REQUESTS_PER_RUN` — Hard cap on API requests per run (default: `8`) — **the key setting**
 - `MERGE_PRESERVE` — Keep rows for wallets not refreshed this run (default: `1`; `0` = destructive full refresh)
 - `MIN_SUCCESS_RATIO` — Only used when `MERGE_PRESERVE=0` (default: `0.5`)
 - `HTTP_USER_AGENT` — Override the request User-Agent (optional)
@@ -148,7 +149,31 @@ schedule:
 Trigger manually:
 1. Go to **Actions** tab
 2. Select **Rabby Transaction Sync** workflow
-3. Click **Run workflow** (optionally override the batch count)
+3. Click **Run workflow** — no inputs; the split comes from `BATCH_TOTAL`
+
+### Running batches by hand
+
+The quota is **per IP**. On Actions every matrix job gets a fresh runner, and
+therefore a fresh quota — that is why 25 small jobs work. Run locally and *all*
+batches share your one IP, so the quota applies across the whole session:
+
+```bash
+node src/index.js --batch 1/25     # ~4 wallets, ~8 requests — then stop
+# wait for the quota window before the next one
+node src/index.js --batch 2/25
+```
+
+- **One batch per sitting.** `MAX_REQUESTS_PER_RUN=8` stops the run cleanly, but
+  the next batch starts against the same, already-spent quota.
+- **Wait between batches.** The reset window is not documented; blocks were
+  observed lasting over 5 minutes. Start at ~15 minutes and shorten it only if
+  runs stay clean.
+- To cover everything from one IP, expect ~25 sittings — Actions does it in one
+  workflow precisely because each job gets a different IP.
+
+Nothing is lost by stopping early: unfetched wallets keep their rows
+(`MERGE_PRESERVE`) and the start position rotates (`ROTATION_PERIOD_MS`), so
+coverage converges across runs.
 
 ### Local Testing
 
@@ -227,6 +252,33 @@ strategy:
 Slicing is **deterministic and exact** — 200 wallets over 10 batches gives 20 each;
 205 gives `21,21,21,21,21,20,20,20,20,20`. No wallet is fetched twice or missed.
 
+### The block is a request *count* quota, not a rate limit
+
+Two measured runs settle it:
+
+| Run | Requests | Elapsed | Rate | Blocked at |
+|---|---|---|---|---|
+| A | 11 | 149s | 4.4/min | request **11** |
+| B | 10 | 215s | 2.8/min | request **10** |
+
+Pacing differed by 60%; the block arrived at the same *request number*. Slowing
+down therefore cannot help — only sending fewer requests can.
+
+**`MAX_REQUESTS_PER_RUN` (default 8) is the setting that matters.** The run stops
+cleanly when the budget is spent, instead of burning cooldowns on requests that
+are certain to be refused.
+
+Because every matrix job gets a **fresh runner, and therefore a fresh quota**, the
+way to cover more wallets is *more, smaller batches* — not a bigger budget:
+
+```
+98 wallets ÷ 25 batches = ~4 wallets/job × 2 requests = 8 requests   ✓ under quota
+98 wallets ÷ 10 batches = ~10 wallets/job × 2 requests = 20 requests ✗ blocked at 10
+```
+
+Each wallet costs **2** requests because the API answers the first one with a
+pending job and we have to poll for the result.
+
 ### Keeping parallel jobs off the rate limiter
 
 All GitHub-hosted runners egress from shared Azure ranges, so the upstream sees
@@ -272,9 +324,11 @@ cleared the tab and destroyed the rows of every wallet it didn't reach.
 A wallet that succeeds with **zero** in-window transactions correctly ends up with
 no rows — that is a real result, not a gap.
 
-> ⚠️ Existing tabs need the `wallet_address` header added in column **AJ**. Rows
-> written before it existed cannot be attributed and are dropped once, then
-> repopulate as their wallets are refreshed. New batch tabs get it automatically.
+> Tabs created before `wallet_address` existed are migrated **automatically**: the
+> grid is widened to 36 columns and the header row is rewritten on first write.
+> No manual spreadsheet edit is needed. Rows written before the column existed
+> cannot be attributed and are dropped once, then repopulate as their wallets are
+> refreshed.
 
 ### Google Sheets write quota
 

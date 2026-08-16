@@ -87,9 +87,10 @@ Key environment variables:
   TARGET_SHEET_NAME        Same as --sheet (CLI wins)
   BATCH_INDEX/BATCH_TOTAL  Same as --batch (CLI wins)
   BATCH_SHEET_PREFIX       Prefix for batch tabs (default: Batch_)
-  HISTORY_DAYS             Look-back window in days, by time_at (default: 90; 0 = off)
+  HISTORY_DAYS             Look-back window in days, by time_at (default: 180; 0 = off)
   ROTATION_PERIOD_MS       Rotate the starting wallet each run (default: 3600000)
   MERGE_PRESERVE           Keep rows for wallets not refreshed this run (default: 1)
+  MAX_REQUESTS_PER_RUN     Hard cap on API requests per run (default: 8)
   PAGE_COUNT               Safety ceiling on rows per wallet (default: 2000)
   PAGE_SIZE                Rows per API request (default: 200)
   MAX_PAGES_PER_WALLET     Anti-runaway page cap (default: 20)
@@ -242,6 +243,14 @@ const RATE_LIMIT_CONFIG = {
   // Rotating the starting position spreads that cost around. 0 disables it.
   ROTATION_PERIOD_MS: num('ROTATION_PERIOD_MS', 3600000),
 
+  // Hard cap on API requests per run. Measured across two runs, the upstream
+  // blocks at request ~10 per IP REGARDLESS of pacing: 11 requests over 149s
+  // (4.4/min) and 10 over 215s (2.8/min) both tripped it. So this is a request
+  // COUNT quota, not a rate limit, and slowing down cannot help. Each matrix job
+  // runs on a fresh runner with a fresh quota, so the fix is fewer requests per
+  // job and more jobs. At 2 requests per wallet, 8 covers 4 wallets safely.
+  MAX_REQUESTS_PER_RUN: num('MAX_REQUESTS_PER_RUN', 8),
+
   // --- Global safety guard (prevents a GitHub Actions "Canceled") ---
   // The workflow's own timeout is 30 min. We stop fetching well before that and
   // reserve time to flush whatever we already have to Google Sheets, so the run
@@ -259,7 +268,7 @@ const RATE_LIMIT_CONFIG = {
   // row count — it is what keeps request volume low, because most wallets need
   // one or two pages to cover 90 days instead of ten to reach 2000 rows.
   // Set to 0 to disable and fall back to the MAX_TX_PER_WALLET ceiling alone.
-  HISTORY_DAYS: num('HISTORY_DAYS', 90),
+  HISTORY_DAYS: num('HISTORY_DAYS', 180),
 
   PAGE_SIZE: num('PAGE_SIZE', 200),                       // rows per request
   MAX_TX_PER_WALLET: num('PAGE_COUNT', 2000),             // safety ceiling per wallet
@@ -458,6 +467,14 @@ class DeadlineError extends Error {
   }
 }
 
+/** Thrown when the run has used its whole API request quota. */
+class BudgetError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BudgetError';
+  }
+}
+
 /** Thrown when a wallet is given up on because of a 429/403 soft-block. */
 class BlockedError extends Error {
   constructor(message) {
@@ -543,6 +560,7 @@ class RateLimitManager {
     this.lastRequest = 0;
     this.cooldownUntil = 0; // wall-clock time we're allowed to send again
     this.consecutiveBlocks = 0;
+    this.requestsMade = 0;  // counted against MAX_REQUESTS_PER_RUN
   }
 
   /**
@@ -582,7 +600,13 @@ class RateLimitManager {
       await sleep(spacing - since);
     }
     this.lastRequest = Date.now();
+    this.requestsMade++;
     return true;
+  }
+
+  /** Requests still available before the upstream quota is expected to bite. */
+  budgetLeft() {
+    return RATE_LIMIT_CONFIG.MAX_REQUESTS_PER_RUN - this.requestsMade;
   }
 
   /** A request succeeded — relax the throttle gently back toward the floor. */
@@ -673,6 +697,13 @@ async function fetchHistoryPage(walletAddress, startTime, rateLimitMgr, budget, 
     // Global guard: never start another request if the run is out of time.
     if (fetchBudgetRemainingMs() <= 0) {
       throw new DeadlineError('global time budget exhausted');
+    }
+
+    // Request quota: stop cleanly BEFORE the upstream starts refusing us, rather
+    // than burning cooldowns on requests that are certain to be blocked.
+    if (rateLimitMgr.budgetLeft() <= 0) {
+      throw new BudgetError(
+        `request quota reached (${cfg.MAX_REQUESTS_PER_RUN} requests this run)`);
     }
 
     // Honors any open cooldown; false means waiting it out would blow the deadline.
@@ -1079,7 +1110,41 @@ async function findSheetProps(sheets, sheetName) {
 async function ensureSheetTab(sheets, sheetName) {
   const existing = await withRetry(
     () => findSheetProps(sheets, sheetName), `Look up tab "${sheetName}"`);
-  if (existing) return existing;
+
+  if (existing) {
+    // Tabs created before wallet_address existed have only 35 columns, and a
+    // 36-wide write into them fails with "exceeds grid limits". Widen the grid
+    // and refresh the header so no manual spreadsheet edit is ever needed.
+    const cols = existing.gridProperties?.columnCount || 0;
+    if (cols < SHEET_HEADER.length) {
+      log('INFO', `Widening "${sheetName}" from ${cols} to ${SHEET_HEADER.length} columns`);
+      await withRetry(() => sheets.spreadsheets.batchUpdate({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        resource: {
+          requests: [{
+            updateSheetProperties: {
+              properties: {
+                sheetId: existing.sheetId,
+                gridProperties: { columnCount: SHEET_HEADER.length },
+              },
+              fields: 'gridProperties.columnCount',
+            },
+          }],
+        },
+      }), `Widen tab "${sheetName}"`);
+
+      await withRetry(() => sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: `${sheetName}!A1`,
+        valueInputOption: 'RAW',
+        resource: { values: [SHEET_HEADER] },
+      }), `Write header row in "${sheetName}"`);
+      log('OK', `"${sheetName}" migrated — wallet_address header added automatically`);
+
+      existing.gridProperties.columnCount = SHEET_HEADER.length;
+    }
+    return existing;
+  }
 
   log('INFO', `Tab "${sheetName}" not found — creating it`);
   try {
@@ -1358,6 +1423,8 @@ async function processTransactions() {
     : `up to ${cfg0.MAX_TX_PER_WALLET} rows`;
   log('INFO', `${c.bold('Starting sync')} for ${scope} → tab ${c.cyan(sheetName)} ` +
     `${c.dim(`(${windowLabel})`)}`);
+  log('INFO', `Request quota: ${c.bold(RATE_LIMIT_CONFIG.MAX_REQUESTS_PER_RUN)} this run ` +
+    `${c.dim('(~2 per wallet — the API answers the first request with a pending job)')}`);
   log('INFO', `Throttle: ${RATE_LIMIT_CONFIG.JITTER_MIN_MS}-${RATE_LIMIT_CONFIG.JITTER_MAX_MS}ms between ` +
     `requests, ${RATE_LIMIT_CONFIG.PAGE_DELAY_MIN_MS}-${RATE_LIMIT_CONFIG.PAGE_DELAY_MAX_MS}ms between pages | ` +
     `Egress: ${PROXY_URL ? c.cyan('proxy ' + maskProxy(PROXY_URL)) : 'direct'}`);
@@ -1380,6 +1447,13 @@ async function processTransactions() {
     // Guard 1 — global deadline: stop fetching while there's still time to save.
     if (fetchBudgetRemainingMs() <= 0) {
       stopReason = `time budget reached after ${fmtDuration(elapsedMs())}`;
+      break;
+    }
+
+    // Guard 1b — request quota: a wallet costs ~2 requests (the API answers the
+    // first with a pending job), so stop before starting one we cannot finish.
+    if (rateLimitMgr.budgetLeft() < 2) {
+      stopReason = `request quota reached (${RATE_LIMIT_CONFIG.MAX_REQUESTS_PER_RUN} requests)`;
       break;
     }
 
@@ -1442,10 +1516,13 @@ async function processTransactions() {
     } catch (err) {
       const elapsed = ((Date.now() - walletStartTime) / 1000).toFixed(1);
 
-      if (err instanceof DeadlineError) {
-        // Out of time mid-wallet — abandon the fetch phase, keep what we have.
+      if (err instanceof DeadlineError || err instanceof BudgetError) {
+        // Out of time or out of request quota — abandon the fetch phase and keep
+        // what we have. Merge-preserve means the untouched wallets keep their rows.
         processed--;
-        stopReason = `time budget reached (${err.message})`;
+        stopReason = err instanceof BudgetError
+          ? err.message
+          : `time budget reached (${err.message})`;
         break;
       }
 
@@ -1472,6 +1549,7 @@ async function processTransactions() {
   log('INFO', `${c.bold('Summary')} — ${c.green(okCount + ' ok')}, ${c.red(errorCount + ' failed')}, ` +
     `${c.yellow(skipped + ' skipped')} of ${wallets.length} | ` +
     `${totalRaw} fetched → ${c.bold(totalFiltered)} kept (${totalScam} scam) | ` +
+    `${rateLimitMgr.requestsMade}/${RATE_LIMIT_CONFIG.MAX_REQUESTS_PER_RUN} requests | ` +
     `elapsed ${fmtDuration(elapsedMs())}`);
 
   // Newest transaction first across every wallet in this batch.
@@ -1684,6 +1762,7 @@ if (require.main === module) {
 module.exports = {
   RateLimitManager,
   DeadlineError,
+  BudgetError,
   BlockedError,
   parseRetryAfter,
   fmtDuration,
