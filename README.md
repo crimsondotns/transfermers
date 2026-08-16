@@ -63,11 +63,11 @@ Create a spreadsheet and share it with the service account email as **Editor**.
 
 For a single-tab setup, create the tab with headers in row 1:
 
-| A | B | C | D | E | F | ... | AI | AJ | AK |
-|---|---|---|---|---|---|-----|-----|-----|-----|
-| cate_id | cex_id | chain | id | idx | is_scam | ... | recorded_at | transfer_idx | raw |
+| A | B | C | D | E | F | ... | AI | AJ | AK | AL |
+|---|---|---|---|---|---|-----|-----|-----|-----|-----|
+| cate_id | cex_id | chain | id | idx | is_scam | ... | recorded_at | transfer_idx | raw | suspect |
 
-**Or use the provided header template** (37 columns A:AK):
+**Or use the provided header template** (38 columns A:AL):
 
 ```
 cate_id | cex_id | chain | id | idx | is_scam | other_addr | project_id | 
@@ -76,7 +76,7 @@ send_amount | send_price | send_to_addr | send_token_id |
 time_at | approve_label | approve_spender | approve_token_id | approve_value | 
 tx_label | tx_eth_gas_fee | tx_from_addr | tx_id | tx_idx | 
 tx_message | tx_name | tx_params | tx_selector | tx_status | tx_to_addr | 
-tx_usd_gas_fee | tx_value | recorded_at | transfer_idx | raw
+tx_usd_gas_fee | tx_value | recorded_at | transfer_idx | raw | suspect
 ```
 
 > **Upgrading an existing sheet?** Nothing to do. A tab narrower than the header
@@ -129,6 +129,8 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
 - `MAX_REQUESTS_PER_RUN` — Hard cap on API requests per run (default: `8`) — **the key setting**
 - `MIN_SUCCESS_RATIO` — Share of a batch that must succeed before results are written (default: `0`; writes merge, so partial results are safe)
+- `SUSPECT_DUST_USD` — Below this USD value a relayed transfer counts as poisoning dust (default: `0.01`; `0` disables the detection)
+- `DROP_SUSPECTED` — `1` deletes the rows flagged `dust_relayed` instead of only flagging them (default: `0`)
 - `HTTP_USER_AGENT` — Override the request User-Agent (optional)
 
 See `config/example.env` for full template.
@@ -239,21 +241,45 @@ In `.github/workflows/sync.yml`, keep these two in sync:
 
 ```yaml
 env:
-  BATCH_TOTAL: '10'                          # must equal the matrix length
+  BATCH_TOTAL: '50'                          # must equal the matrix length
 strategy:
   fail-fast: false                           # one blocked batch ≠ cancel the rest
   max-parallel: 1                            # be polite to Rabby
   matrix:
-    batch: [1,2,3,4,5,6,7,8,9,10]
+    batch: [1,2,3, … ,50]
 ```
 
-- **More batches** → fewer wallets per job → each job finishes faster
-- **Lower `max-parallel`** → gentler on Rabby's rate limit. A measured run got a
-  429 after 10 requests in 149s (~4 req/min), so `1` is the safe setting.
-- `fail-fast: false` matters: without it, one blocked batch cancels the other nine
+**Size the split from the request budget, not the wallet count.** Every matrix
+job gets a fresh runner and therefore a fresh quota, so covering more wallets
+means *more, smaller jobs* — raising `MAX_REQUESTS_PER_RUN` only walks into the
+upstream block. Two real wallets, measured:
 
-Slicing is **deterministic and exact** — 200 wallets over 10 batches gives 20 each;
-205 gives `21,21,21,21,21,20,20,20,20,20`. No wallet is fetched twice or missed.
+| Wallet | Transactions in window | Pages | Requests |
+|---|---|---|---|
+| busy | 365 | 2 | ~3–4 |
+| quiet | 120 | 1 | ~2 |
+
+Against the 8-request budget that is **2 wallets per job**, comfortably, or 3
+only if none of them is busy:
+
+| `BATCH_TOTAL` | Wallets/job for 100 | Requests/job | Complete in one run? | Wall time |
+|---|---|---|---|---|
+| 25 | 4 | 12–16 | ❌ over budget, tail deferred to rotation | ~50 min |
+| 34 | 3 | 9–12 | risky | ~70 min |
+| **50** | **2** | **6–8** | ✅ | **~100 min** |
+
+Nothing is *lost* when a batch runs over budget — rotation picks the skipped
+wallets up on a later run, and writes merge rather than replace. It just means a
+single run is not a complete snapshot.
+
+- `fail-fast: false` matters: without it, one blocked batch cancels all the others
+- **Lower `max-parallel`** → gentler on Rabby. A measured run got a 429 after 10
+  requests in 149s (~4 req/min), so `1` is the safe setting. Raising it to `2`
+  roughly halves the wall time and is worth testing if 100 minutes is too long —
+  watch for 403s coming back.
+
+Slicing is **deterministic and exact** — 100 wallets over 50 batches gives 2 each;
+120 gives 20 batches of 3 and 30 of 2. No wallet is fetched twice or missed.
 
 ### The block is a request *count* quota, not a rate limit
 
@@ -318,7 +344,7 @@ request it has. What it *did* fetch is still saved:
 2. **Merge** them with the fresh rows. Wallets this run never reached keep their
    rows because their keys aren't in the fresh set. Rows older than `HISTORY_DAYS`
    are pruned so the tab can't grow forever.
-3. **ClearContent** — wipe `A2:AK`
+3. **ClearContent** — wipe `A2:AL`
 4. **Write** the merged set, newest first
 
 **The merge key is the digest of the `raw` column plus `transfer_idx`** — not the
@@ -388,7 +414,7 @@ get their own exponential backoff. Raise it if you increase `max-parallel`.
               │
               ▼
      ┌────────────────────────────────────┐
-     │ Map to 37-column row format        │
+     │ Map to 38-column row format        │
      │ one row per transfer in the tx     │
      └────────┬─────────────────────────────┘
               │
@@ -549,6 +575,46 @@ spirit of the API's limits. Two honest options actually fix it:
 
 ---
 
+## 🎣 Address poisoning (the dust the scam filter misses)
+
+Rabby returns these with **`is_scam: false`**, so the scam filter never sees them.
+The attack works like this:
+
+1. You pay a counterparty, say `0x42a8895f…386d328e`
+2. An attacker grinds out a vanity address sharing its first and last 4 characters —
+   `0x42a88c57…386d328e` — and sends you a **fraction of a cent** from it
+3. That look-alike is now sitting in your transaction history
+4. Next time you pay that counterparty you copy the address out of your history,
+   glance at `0x42a8…328e`, and send the money to the attacker
+
+Rows are scored on two independent signals and the result is written to the
+**`suspect` column (AL)**:
+
+| Value | Meaning | Dropped by `DROP_SUSPECTED`? |
+|---|---|---|
+| `dust_relayed` | Worth less than `SUSPECT_DUST_USD` **and** the `receive` did not come from the account that sent the transaction. A genuine wallet-to-wallet transfer has `tx_from_addr` = `recv_from_addr`; poisoning is emitted in bulk by a contract, so they differ. | ✅ yes |
+| `lookalike` | `other_addr` shares its first 4 and last 4 hex characters with a *different* address elsewhere in the batch. | ❌ never |
+| *(empty)* | Clean. | — |
+
+**`lookalike` never drops a row**, and that is deliberate: it flags *both* halves
+of a pair and cannot tell the impostor from the address being imitated. Dropping
+on it would delete real history — usually the very payment the attacker is
+targeting. Treat it as "read this address character by character before copying it".
+
+Measured against 515 real rows from two wallets:
+
+```
+dust_relayed            70 rows,  $0.005757 in total,  largest single $0.001
+lookalike              231 rows,  8 look-alike groups (one impersonating the user's own wallet)
+largest row kept       $9,396.69 swap — untouched
+```
+
+**Flagging is the default; nothing is deleted.** Filter column AL in the sheet, or
+set `DROP_SUSPECTED=1` to have the `dust_relayed` rows discarded before the write.
+`SUSPECT_DUST_USD=0` turns the detection off entirely.
+
+---
+
 ## 🐛 Troubleshooting
 
 ### "429 Too Many Requests"
@@ -640,7 +706,7 @@ re-shuffles which wallets land in which tab, so old tabs beyond the new count
 
 ## 📝 Output Format
 
-Each **transfer** becomes one row with 37 columns. A transaction that moves a
+Each **transfer** becomes one row with 38 columns. A transaction that moves a
 single token is one row, as before; one that moves several becomes one row per
 token, because `receives` and `sends` are arrays and reading only element `[0]`
 used to discard the rest.
@@ -657,6 +723,7 @@ used to discard the rest.
 | AI | recorded_at | `"08/14/2026 15:30:45"` |
 | AJ | transfer_idx | `0` |
 | AK | raw | `{"cate_id":"send",...}` |
+| AL | suspect | `dust_relayed+lookalike` |
 
 **`cate_id` is often empty** — Rabby only sets it for the send/receive/approve/
 cancel shapes. A contract call arrives with `cate_id: null`, so those rows have a

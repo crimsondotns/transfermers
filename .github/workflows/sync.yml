@@ -12,10 +12,18 @@ on:
 
 env:
   # Number of matrix slices. MUST match the length of the matrix.batch list below.
-  # Sized from the upstream quota, not from wallet count: the API blocks at about
-  # 10 requests per IP and each wallet costs 2 requests, so a job can safely do
-  # ~4 wallets. 98 wallets / 25 batches = ~4 each.
-  BATCH_TOTAL: '25'
+  #
+  # Sized from the upstream quota, not from wallet count. The API blocks at about
+  # 10 requests per IP, and MAX_REQUESTS_PER_RUN caps a job at 8. Measured against
+  # two real wallets: one had 365 transactions in the window (2 pages) and cost
+  # ~3-4 requests, the other 120 (1 page) and cost ~2. So a job covers 2 wallets
+  # comfortably and 3 only if none of them is busy.
+  #
+  # 100 wallets / 50 batches = 2 each, which fits the budget every run instead of
+  # leaving the tail of each batch to be picked up by rotation on a later run.
+  # More, smaller jobs is the lever here — every matrix job gets a fresh runner
+  # and therefore a fresh quota, so raising MAX_REQUESTS_PER_RUN would not help.
+  BATCH_TOTAL: '50'
 
 jobs:
   sync:
@@ -32,9 +40,13 @@ jobs:
       # Kept at 1 so the jobs do not share an egress window.
       max-parallel: 1
       matrix:
+        # Length MUST equal BATCH_TOTAL above — change both together, or every
+        # job past BATCH_TOTAL fails with "batch index out of range".
         batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
                 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-                21, 22, 23, 24, 25]
+                21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+                41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
 
     name: batch ${{ matrix.batch }}
 
@@ -88,6 +100,15 @@ jobs:
           MAX_PAGES_PER_WALLET: '20'     # anti-runaway cap
           PAGE_DELAY_MIN_MS: '1500'      # spacing between pages of one wallet
           PAGE_DELAY_MAX_MS: '2000'
+
+          # --- Address-poisoning detection ---
+          # Rabby reports these with is_scam:false, so the scam filter misses
+          # them. A transfer worth less than this in USD that arrived from a
+          # relayer rather than its stated sender is flagged in the `suspect`
+          # column (AL). Rows are FLAGGED, not removed — set DROP_SUSPECTED to
+          # '1' to discard them instead.
+          SUSPECT_DUST_USD: '0.01'
+          DROP_SUSPECTED: '0'
 
           LOG_LEVEL: 'INFO'
 

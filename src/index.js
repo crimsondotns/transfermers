@@ -294,6 +294,14 @@ const RATE_LIMIT_CONFIG = {
   // Share of a batch that must succeed before its results are written. Writes
   // merge on transaction id, so partial results are additive and 0 is safe.
   MIN_SUCCESS_RATIO: parseFloat(process.env.MIN_SUCCESS_RATIO || '0'),
+
+  // --- Address-poisoning detection (see flagSuspectRows) ---
+  // A transfer worth less than this in USD is dust. Combined with the relayer
+  // check it is what identifies a poisoning row; 0 disables the detection.
+  SUSPECT_DUST_USD: parseFloat(process.env.SUSPECT_DUST_USD || '0.01'),
+  // Off by default: rows are FLAGGED in the `suspect` column, not removed, so
+  // nothing disappears from the sheet without you asking for it.
+  DROP_SUSPECTED: process.env.DROP_SUSPECTED === '1',
 };
 
 // Honest client headers — we identify as a normal HTTP/JSON client and rely on
@@ -1107,6 +1115,7 @@ function mapTransactionToRow(tx, walletAddr, transferIdx = 0, raw = undefined) {
       null, // [34] recorded_at — filled during write
       transferIdx,                                     // [35] transfer_idx
       raw === undefined ? rawCell(tx) : raw,           // [36] raw
+      null, // [37] suspect — filled by flagSuspectRows, which needs the whole batch
     ];
   } catch (err) {
     log('ERROR', `Mapping failed for wallet ${maskAddr(walletAddr)}: ${err.message}`);
@@ -1171,7 +1180,7 @@ const SHEET_HEADER = [
   'tx_label', 'tx_eth_gas_fee', 'tx_from_addr', 'tx_id', 'tx_idx',
   'tx_message', 'tx_name', 'tx_params', 'tx_selector', 'tx_status', 'tx_to_addr',
   'tx_usd_gas_fee', 'tx_value', 'recorded_at',
-  'transfer_idx', 'raw',
+  'transfer_idx', 'raw', 'suspect',
 ];
 
 // Last column letter of the header, used in every A1 range below so the ranges
@@ -1191,6 +1200,118 @@ const DATA_RANGE = `A2:${LAST_COL}`;
 /** True when a row carries the `raw` column, i.e. it was written by this version. */
 function hasRaw(row) {
   return row[36] != null && String(row[36]) !== '';
+}
+
+// ---------------------------------------------------------------------------
+// Address-poisoning detection
+// ---------------------------------------------------------------------------
+// Rabby reports these with `is_scam: false`, so the scam filter never sees them.
+// The attack: send a dust transfer from an address generated to share the first
+// and last few characters of one you really deal with, so the look-alike lands
+// in your history and you copy it by mistake next time you pay that counterparty.
+//
+// Two independent signals, measured against 515 real rows:
+//
+//   dust_relayed  a tiny transfer whose `receive` did not come from the account
+//                 that sent the transaction. A genuine wallet-to-wallet transfer
+//                 has tx.from_addr === receives[].from_addr; a poisoning run is
+//                 emitted by a contract in bulk, so they differ. 70 rows matched,
+//                 worth $0.0058 in total, the largest single one $0.001.
+//
+//   lookalike     `other_addr` shares its first 4 and last 4 hex characters with
+//                 a DIFFERENT address elsewhere in the same batch. Only one of
+//                 the pair is the impostor and this signal cannot say which, so
+//                 it never drops a row — it is a warning to read before copying
+//                 an address out of the sheet.
+
+/** USD value moved by one row, from whichever side of the transfer is filled. */
+function rowUsdValue(row) {
+  let total = 0;
+  for (const [amountIdx, priceIdx] of [[8, 10], [12, 13]]) {
+    const amount = Number(row[amountIdx]);
+    const price = Number(row[priceIdx]);
+    if (Number.isFinite(amount) && Number.isFinite(price)) total += amount * price;
+  }
+  return total;
+}
+
+/** The high-confidence signal: dust that arrived via a relayer, not its sender. */
+function isDustRelayed(row) {
+  const threshold = RATE_LIMIT_CONFIG.SUSPECT_DUST_USD;
+  if (threshold <= 0) return false;
+
+  const value = rowUsdValue(row);
+  // A zero-value row is an approve or a bare contract call, not a dust transfer.
+  if (!(value > 0 && value < threshold)) return false;
+
+  if (row[0] !== 'receive') return false;
+  const txFrom = row[23];      // tx_from_addr — who sent the transaction
+  const recvFrom = row[9];     // recv_from_addr — who the tokens came from
+  if (typeof txFrom !== 'string' || typeof recvFrom !== 'string') return false;
+  return txFrom.toLowerCase() !== recvFrom.toLowerCase();
+}
+
+/** First-4 / last-4 fingerprint of an address, or null when it is not one. */
+function addrFingerprint(addr) {
+  if (typeof addr !== 'string') return null;
+  const a = addr.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(a)) return null;
+  return `${a.slice(2, 6)}…${a.slice(-4)}`;
+}
+
+/**
+ * Fill the `suspect` column (index 37) across a batch of rows, in place.
+ *
+ * Needs the whole batch at once because `lookalike` is a relationship between
+ * addresses, not a property of one row.
+ */
+function flagSuspectRows(rows) {
+  const byFingerprint = new Map();
+  for (const row of rows) {
+    const fp = addrFingerprint(row[6]); // other_addr
+    if (!fp) continue;
+    if (!byFingerprint.has(fp)) byFingerprint.set(fp, new Set());
+    byFingerprint.get(fp).add(String(row[6]).toLowerCase());
+  }
+
+  let dust = 0;
+  let lookalike = 0;
+  for (const row of rows) {
+    const reasons = [];
+    if (isDustRelayed(row)) reasons.push('dust_relayed');
+    const fp = addrFingerprint(row[6]);
+    if (fp && byFingerprint.get(fp).size > 1) reasons.push('lookalike');
+
+    row[37] = reasons.length ? reasons.join('+') : null;
+    if (reasons.includes('dust_relayed')) dust++;
+    if (reasons.includes('lookalike')) lookalike++;
+  }
+
+  const groups = [...byFingerprint.values()].filter((s) => s.size > 1).length;
+  if (dust || lookalike) {
+    log('WARN', `Suspected address poisoning: ${c.bold(dust)} dust row(s) delivered ` +
+      `by a relayer, ${c.bold(lookalike)} row(s) whose counterparty looks like another ` +
+      `address in this batch (${groups} look-alike group(s))`);
+  }
+  return { dust, lookalike, groups };
+}
+
+/**
+ * Drop the rows DROP_SUSPECTED is meant to remove.
+ *
+ * Only `dust_relayed` is ever dropped. `lookalike` alone flags both halves of a
+ * pair and cannot tell the impostor from the address it imitates, so acting on
+ * it would delete real history.
+ */
+function dropSuspectRows(rows) {
+  if (!RATE_LIMIT_CONFIG.DROP_SUSPECTED) return rows;
+  const kept = rows.filter((row) => !String(row[37] || '').includes('dust_relayed'));
+  const dropped = rows.length - kept.length;
+  if (dropped) {
+    log('WARN', `DROP_SUSPECTED=1 — discarded ${c.bold(dropped)} suspected ` +
+      `address-poisoning row(s); ${kept.length} kept`);
+  }
+  return kept;
 }
 
 /**
@@ -1734,7 +1855,13 @@ async function processTransactions() {
 
   // Newest transaction first across every wallet in this batch.
   collected.sort((a, b) => b.timeAt - a.timeAt);
-  const allRows = collected.map((entry) => entry.row);
+  let allRows = collected.map((entry) => entry.row);
+
+  // Runs over the whole batch at once: `lookalike` compares addresses against
+  // each other, so it cannot be decided one row at a time.
+  flagSuspectRows(allRows);
+  allRows = dropSuspectRows(allRows);
+
   if (allRows.length) {
     log('INFO', `Sorted ${c.bold(allRows.length)} rows newest-first — ` +
       `${c.cyan(formatDateTH(collected[0].timeAt))} → ${c.cyan(formatDateTH(collected[collected.length - 1].timeAt))}`);
@@ -1814,7 +1941,7 @@ async function runManualMode(walletAddress) {
   log('OK', `${c.magenta(masked)}: ${c.bold(filtered.length)} txs kept ` +
     `(${rawList.length} fetched over ${pages} page(s), ${attempts} request(s)) — newest ${c.cyan(newest)}`);
 
-  const rows = [];
+  let rows = [];
   for (const tx of filtered) {
     try {
       rows.push(...mapTransactionToRows(tx, addr));
@@ -1822,6 +1949,8 @@ async function runManualMode(walletAddress) {
       log('WARN', `Mapping error for tx ${tx.id}: ${mapErr.message}`);
     }
   }
+  flagSuspectRows(rows);
+  rows = dropSuspectRows(rows);
 
   const written = await appendToSheet(rows, sheetName);
   log('OK', `${c.bold('Manual retry completed')} in ${fmtDuration(elapsedMs())} — ` +
@@ -1973,6 +2102,11 @@ module.exports = {
   legacyKeyOf,
   hasRaw,
   rawDigest,
+  rowUsdValue,
+  isDustRelayed,
+  addrFingerprint,
+  flagSuspectRows,
+  dropSuspectRows,
   maskAddr,
   RATE_LIMIT_CONFIG,
 };
