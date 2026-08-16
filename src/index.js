@@ -298,6 +298,12 @@ const RATE_LIMIT_CONFIG = {
   // merge on transaction id, so partial results are additive and 0 is safe.
   MIN_SUCCESS_RATIO: parseFloat(process.env.MIN_SUCCESS_RATIO || '0'),
 
+  // 1 = the tab holds exactly what this run fetched: no merge with what was
+  // already there, so every recorded_at in it comes from the same run. Pair it
+  // with MIN_SUCCESS_RATIO=1, or a run that misses a wallet writes a thinner
+  // snapshot over a complete one.
+  FULL_REFRESH: process.env.FULL_REFRESH === '1',
+
   // --- Address-poisoning detection (see flagSuspectRows) ---
   // A transfer worth less than this in USD is dust. Combined with the relayer
   // check it is what identifies a poisoning row; 0 disables the detection.
@@ -1563,32 +1569,52 @@ async function writeToSheet(rows, sheetName) {
     ? Date.now() - RATE_LIMIT_CONFIG.HISTORY_DAYS * 86400000
     : 0;
 
-  const existing = await withRetry(() => sheets.spreadsheets.values.get({
-    spreadsheetId: GOOGLE_SPREADSHEET_ID,
-    range: `${sheetName}!${DATA_RANGE}`,
-  }), `Read existing rows from "${sheetName}"`);
-
-  for (const row of existing.data.values || []) {
-    const key = keyOf(row);
-    if (merged.has(key)) continue;                       // refreshed this run
-    const older = olderKeyOf(row);
-    if (older !== null && claimedOlder.has(older)) {
-      superseded++;                                      // older-format row, re-fetched
-      continue;
+  // FULL_REFRESH: skip the merge entirely, so the tab ends up holding exactly
+  // what this run fetched and nothing else. Every `recorded_at` in the tab is
+  // then from the same run, which is the point — the tab answers "how fresh is
+  // this?" by construction instead of by reading a column.
+  //
+  // The merge exists because a run that does not reach every wallet would
+  // otherwise delete the rows of the ones it missed, which is the data loss that
+  // PR #13 fixed. Turning it off puts that risk back, so MIN_SUCCESS_RATIO is
+  // what keeps a partial run from replacing a good snapshot with a thin one.
+  if (RATE_LIMIT_CONFIG.FULL_REFRESH) {
+    log('INFO', `Full refresh of "${sheetName}": writing only the ` +
+      `${c.bold(fresh.length)} row(s) fetched this run — previous contents are replaced`);
+    if (RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO < 1) {
+      log('WARN', `FULL_REFRESH=1 with MIN_SUCCESS_RATIO=` +
+        `${RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO} — a run that misses a wallet will ` +
+        `replace this tab with a thinner snapshot. Set MIN_SUCCESS_RATIO=1 to ` +
+        `hold the write back instead.`);
     }
-    if (cutoffMs && parseDateTH(row[16]) < cutoffMs) {    // outside the window now
-      expired++;
-      continue;
-    }
-    merged.set(key, row);
-    carried++;
-  }
+  } else {
+    const existing = await withRetry(() => sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      range: `${sheetName}!${DATA_RANGE}`,
+    }), `Read existing rows from "${sheetName}"`);
 
-  if (carried || expired || superseded) {
-    log('INFO', `Merged with "${sheetName}": ${c.bold(fresh.length)} fetched, ` +
-      `${c.bold(carried)} kept from previous runs` +
-      (superseded ? `, ${superseded} older-format row(s) superseded` : '') +
-      (expired ? `, ${expired} aged out of the window` : ''));
+    for (const row of existing.data.values || []) {
+      const key = keyOf(row);
+      if (merged.has(key)) continue;                       // refreshed this run
+      const older = olderKeyOf(row);
+      if (older !== null && claimedOlder.has(older)) {
+        superseded++;                                      // older-format row, re-fetched
+        continue;
+      }
+      if (cutoffMs && parseDateTH(row[16]) < cutoffMs) {    // outside the window now
+        expired++;
+        continue;
+      }
+      merged.set(key, row);
+      carried++;
+    }
+
+    if (carried || expired || superseded) {
+      log('INFO', `Merged with "${sheetName}": ${c.bold(fresh.length)} fetched, ` +
+        `${c.bold(carried)} kept from previous runs` +
+        (superseded ? `, ${superseded} older-format row(s) superseded` : '') +
+        (expired ? `, ${expired} aged out of the window` : ''));
+    }
   }
 
   const values = [...merged.values()]

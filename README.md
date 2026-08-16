@@ -132,6 +132,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `MAX_TIMEOUT_RETRIES` — Max retries for timeouts (default: `5`)
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
 - `MAX_REQUESTS_PER_RUN` — Hard cap on API requests per run (default: `8`) — **the key setting**
+- `FULL_REFRESH` — `1` makes the tab hold exactly what this run fetched, skipping the merge (default: `0`). Pair with `MIN_SUCCESS_RATIO=1`
 - `MIN_SUCCESS_RATIO` — Share of a batch that must succeed before results are written (default: `0`; writes merge, so partial results are safe)
 - `SUSPECT_DUST_USD` — Below this USD value a relayed transfer counts as poisoning dust (default: `0.01`; `0` disables the detection)
 - `DROP_SUSPECTED` — `1` deletes the rows flagged `dust_relayed` instead of only flagging them (default: `0`)
@@ -339,7 +340,40 @@ secret unset to send traffic directly — nothing changes.
 > Note: a custom `httpsAgent` makes axios ignore the proxy environment variables,
 > so the agent itself is built as a tunnelling agent when a proxy is configured.
 
-### Nothing fetched is ever thrown away
+### Snapshot policy: full refresh vs merge
+
+Two modes, chosen with `FULL_REFRESH`:
+
+| | `FULL_REFRESH=1` (workflow default) | `FULL_REFRESH=0` |
+|---|---|---|
+| The tab holds | exactly what this run fetched | this run **plus** everything still valid from before |
+| `recorded_at` | identical on every row — one snapshot | mixed, one stamp per originating run |
+| Existing rows are | read? **no**, never | read and merged back in |
+| A wallet the run missed | its rows are gone… | …keeps its rows |
+| …unless | `MIN_SUCCESS_RATIO=1` blocks the write | — |
+
+**Use full refresh when you need to trust freshness at a glance.** Every row in
+the tab came from the same run, so there is no question of a stale row from three
+runs ago sitting in the middle of the data. That is why the workflow ships with
+it on.
+
+**It reintroduces a real risk**, which is why the two settings move together:
+without the merge, a run that reaches only some of its wallets writes a thinner
+snapshot over a complete one — exactly the data loss the merge was added to fix.
+`MIN_SUCCESS_RATIO=1` blocks that write instead, so the tab keeps its previous
+contents and the next run refreshes it. The batch size is chosen to suit this: 2
+wallets against an 8-request budget normally completes every wallet.
+
+The log tells you which happened:
+
+```
+Full refresh of "Batch_01": writing only the 214 row(s) fetched this run
+Sheet NOT updated — only 1/2 wallets succeeded (below MIN_SUCCESS_RATIO 1)
+```
+
+---
+
+### Nothing fetched is ever thrown away (merge mode)
 
 A run can end early — the request quota runs out, or one busy wallet needs every
 request it has. What it *did* fetch is still saved:

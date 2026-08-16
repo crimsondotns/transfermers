@@ -156,8 +156,18 @@ jobs:
           MAX_RETRIES: '10'
           MAX_TIMEOUT_RETRIES: '5'
           CHUNK_SIZE: '500'
-          # Writes merge on transaction id, so a partial run only adds rows and
-          # the wallets it missed keep theirs. 0 = always save what we fetched.
-          MIN_SUCCESS_RATIO: '0'
+          # --- Snapshot policy ---
+          # FULL_REFRESH=1: the tab holds exactly what this run fetched, so every
+          # recorded_at in it comes from the same run and "how fresh is this?" is
+          # answered by the tab itself rather than per row.
+          #
+          # These two MUST move together. Without the merge, a run that misses a
+          # wallet would replace a complete snapshot with a thinner one, which is
+          # the data loss PR #13 fixed. MIN_SUCCESS_RATIO=1 blocks that write
+          # instead: the tab keeps its previous contents and the next run retries.
+          # Sized for it — 2 wallets per batch against an 8-request budget, so a
+          # batch normally completes every wallet.
+          FULL_REFRESH: '1'
+          MIN_SUCCESS_RATIO: '1'
         run: |
           node src/index.js --batch ${{ matrix.batch }}/${{ env.BATCH_TOTAL }}
