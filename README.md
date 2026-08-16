@@ -11,7 +11,6 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ✅ **Scales to 200+ Wallets** — Batch split across parallel matrix jobs, one tab each  
 ✅ **Time-Windowed History** — Last 180 days by `time_at`, paginated newest-first  
 ✅ **Fair Rotation** — Starting wallet rotates so a block can't starve the same wallets  
-✅ **Coverage Accumulates** — A blocked wallet keeps its rows; nothing is wiped  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
 ✅ **Rate Limit Aware** — Adaptive throttling + exponential backoff  
 ✅ **429 Handling** — Respects rate limits, retries intelligently  
@@ -124,8 +123,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `MAX_TIMEOUT_RETRIES` — Max retries for timeouts (default: `5`)
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
 - `MAX_REQUESTS_PER_RUN` — Hard cap on API requests per run (default: `8`) — **the key setting**
-- `MERGE_PRESERVE` — Keep rows for wallets not refreshed this run (default: `1`; `0` = destructive full refresh)
-- `MIN_SUCCESS_RATIO` — Only used when `MERGE_PRESERVE=0` (default: `0.5`)
+- `MIN_SUCCESS_RATIO` — Share of a batch that must succeed before the tab is rewritten (default: `1`)
 - `HTTP_USER_AGENT` — Override the request User-Agent (optional)
 
 See `config/example.env` for full template.
@@ -171,9 +169,9 @@ node src/index.js --batch 2/25
 - To cover everything from one IP, expect ~25 sittings — Actions does it in one
   workflow precisely because each job gets a different IP.
 
-Nothing is lost by stopping early: unfetched wallets keep their rows
-(`MERGE_PRESERVE`) and the start position rotates (`ROTATION_PERIOD_MS`), so
-coverage converges across runs.
+Stopping early is safe: with `MIN_SUCCESS_RATIO=1` a partial batch does not
+rewrite its tab, so the previous contents stay, and the start position rotates
+(`ROTATION_PERIOD_MS`) so later runs reach different wallets first.
 
 ### Local Testing
 
@@ -306,29 +304,20 @@ secret unset to send traffic directly — nothing changes.
 > Note: a custom `httpsAgent` makes axios ignore the proxy environment variables,
 > so the agent itself is built as a tunnelling agent when a proxy is configured.
 
-### Coverage accumulates across runs
+### Partial runs never overwrite a tab
 
-A single run does **not** have to succeed for every wallet. Each row carries a
-`wallet_address` (column AJ), so a write only replaces rows for the wallets that
-were actually refreshed — everything else is carried over from the sheet.
+Each tab is rewritten in full, and rows carry no wallet identity, so a run that
+reached only some of its wallets cannot keep the rest of the history.
+`MIN_SUCCESS_RATIO` decides what happens:
 
-```
-run 1:  w1-w5 ok, w6-w10 blocked  ->  w1-w5 fresh + w6-w10 preserved
-run 2:  rotation moves the start  ->  different wallets refresh, none lost
-```
+| Value | Behaviour |
+|---|---|
+| **`1`** (default) | Rewrite only when **every** wallet in the batch succeeded. A partial run writes nothing and the previous contents stay. |
+| `0.5` | Rewrite from half a batch — the wallets that failed lose their rows. |
 
-Combined with wallet rotation, every wallet's data is refreshed over a few runs
-even while some requests are still being soft-blocked. Before this, a partial run
-cleared the tab and destroyed the rows of every wallet it didn't reach.
-
-A wallet that succeeds with **zero** in-window transactions correctly ends up with
-no rows — that is a real result, not a gap.
-
-> Tabs created before `wallet_address` existed are migrated **automatically**: the
-> grid is widened to 36 columns and the header row is rewritten on first write.
-> No manual spreadsheet edit is needed. Rows written before the column existed
-> cannot be attributed and are dropped once, then repopulate as their wallets are
-> refreshed.
+With `MAX_REQUESTS_PER_RUN` sized to the batch, a run normally completes all of
+its wallets, so the tab refreshes every time. When it doesn't, the previous
+snapshot is kept and the next run tries again.
 
 ### Google Sheets write quota
 
