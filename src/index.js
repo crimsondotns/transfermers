@@ -1204,12 +1204,26 @@ async function writeToSheet(rows, sheetName) {
     return row;
   });
 
-  // Merge with whatever is already in the tab, keyed on the transaction id in
-  // column D. Every row already carries a unique id, so wallets this run did not
-  // reach keep their rows without needing any extra column: their transaction ids
-  // simply are not in the fresh set. Rows that aged out of the look-back window
-  // are dropped, so the tab cannot grow forever.
-  const keyOf = (row) => String(row[3] || `${row[2]}:${row[16]}:${row[4]}`);
+  // Merge with whatever is already in the tab. Wallets this run did not reach
+  // keep their rows because their keys are not in the fresh set, and rows that
+  // aged out of the look-back window are dropped so the tab cannot grow forever.
+  //
+  // The key is NOT the transaction id alone. Rabby reports cate_id and the
+  // receives/sends fields relative to the wallet being queried, so one on-chain
+  // transfer between two wallets that are both in the list legitimately produces
+  // TWO rows — 'send' from the payer's view and 'receive' from the payee's — that
+  // share an id. Keying on the id alone silently dropped one of them. Including
+  // the direction fields keeps both while still letting a re-fetch of the same
+  // wallet replace its own previous row.
+  const keyOf = (row) => [
+    row[3] || `${row[2]}:${row[16]}:${row[4]}`, // id (or a composite fallback)
+    row[0],   // cate_id      — send / receive
+    row[6],   // other_addr   — the counterparty from this wallet's side
+    row[8],   // recv_amount
+    row[9],   // recv_from_addr
+    row[12],  // send_amount
+    row[14],  // send_to_addr
+  ].map((v) => (v == null ? '' : String(v))).join('|');
   const merged = new Map(fresh.map((row) => [keyOf(row), row]));
   let carried = 0;
   let expired = 0;

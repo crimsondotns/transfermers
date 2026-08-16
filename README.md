@@ -310,14 +310,24 @@ A run can end early — the request quota runs out, or one busy wallet needs eve
 request it has. What it *did* fetch is still saved:
 
 1. **Read** the rows already in the tab
-2. **Merge** them with the fresh rows, keyed on the **transaction id (column D)**.
-   Wallets this run never reached keep their rows: their transaction ids simply
-   aren't in the fresh set. Rows older than `HISTORY_DAYS` are pruned so the tab
-   can't grow forever.
+2. **Merge** them with the fresh rows. Wallets this run never reached keep their
+   rows because their keys aren't in the fresh set. Rows older than `HISTORY_DAYS`
+   are pruned so the tab can't grow forever.
 3. **ClearContent** — wipe `A2:AI`
 4. **Write** the merged set, newest first
 
-No extra column is needed: every row already carries a unique transaction id.
+**The merge key is not the transaction id alone.** Rabby reports `cate_id` and the
+`receives`/`sends` fields *relative to the wallet being queried*, so one transfer
+between two wallets that are both in your list legitimately produces **two rows**:
+
+| Queried wallet | `cate_id` | `other_addr` |
+|---|---|---|
+| the payer | `send` | the payee |
+| the payee | `receive` | the payer |
+
+Both are correct and both are kept. The key combines the id with the direction
+fields (`cate_id`, `other_addr`, `recv_*`, `send_*`), so the two perspectives stay
+distinct while re-fetching the same wallet still replaces its own row in place.
 
 A wallet that runs out of quota *mid-pagination* keeps the pages it already
 fetched, rather than discarding requests that were already spent.
