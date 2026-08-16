@@ -87,7 +87,7 @@ Key environment variables:
   TARGET_SHEET_NAME        Same as --sheet (CLI wins)
   BATCH_INDEX/BATCH_TOTAL  Same as --batch (CLI wins)
   BATCH_SHEET_PREFIX       Prefix for batch tabs (default: Batch_)
-  HISTORY_DAYS             Look-back window in days, by time_at (default: 90; 0 = off)
+  HISTORY_DAYS             Look-back window in days, by time_at (default: 180; 0 = off)
   ROTATION_PERIOD_MS       Rotate the starting wallet each run (default: 3600000)
   MERGE_PRESERVE           Keep rows for wallets not refreshed this run (default: 1)
   MAX_REQUESTS_PER_RUN     Hard cap on API requests per run (default: 8)
@@ -268,7 +268,7 @@ const RATE_LIMIT_CONFIG = {
   // row count — it is what keeps request volume low, because most wallets need
   // one or two pages to cover 90 days instead of ten to reach 2000 rows.
   // Set to 0 to disable and fall back to the MAX_TX_PER_WALLET ceiling alone.
-  HISTORY_DAYS: num('HISTORY_DAYS', 90),
+  HISTORY_DAYS: num('HISTORY_DAYS', 180),
 
   PAGE_SIZE: num('PAGE_SIZE', 200),                       // rows per request
   MAX_TX_PER_WALLET: num('PAGE_COUNT', 2000),             // safety ceiling per wallet

@@ -9,7 +9,7 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ## ✨ Features
 
 ✅ **Scales to 200+ Wallets** — Batch split across parallel matrix jobs, one tab each  
-✅ **Time-Windowed History** — Last 90 days by `time_at`, paginated newest-first  
+✅ **Time-Windowed History** — Last 180 days by `time_at`, paginated newest-first  
 ✅ **Fair Rotation** — Starting wallet rotates so a block can't starve the same wallets  
 ✅ **Coverage Accumulates** — A blocked wallet keeps its rows; nothing is wiped  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
@@ -99,7 +99,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `BATCH_INDEX` / `BATCH_TOTAL` — Batch slice to process (same as `--batch N/TOTAL`)
 - `TARGET_SHEET_NAME` — Force a target tab (same as `--sheet`)
 - `BATCH_SHEET_PREFIX` — Prefix for batch tabs (default: `Batch_`)
-- `HISTORY_DAYS` — Look-back window in days, by `time_at` (default: `90`; `0` = by row count only)
+- `HISTORY_DAYS` — Look-back window in days, by `time_at` (default: `180`; `0` = by row count only)
 - `ROTATION_PERIOD_MS` — Rotate the starting wallet each run (default: `3600000`; `0` disables)
 - `PAGE_COUNT` — Safety ceiling on rows per wallet (default: `2000`)
 - `PAGE_SIZE` — Rows per API request (default: `200`)

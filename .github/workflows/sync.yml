@@ -40,12 +40,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          # v4 of these actions runs on the Node 20 action runtime, which GitHub
+          # has deprecated; v5+ target node24. Node 20 is also past its own EOL,
+          # so the script runs on 22 LTS.
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -75,8 +78,11 @@ jobs:
           # --- History window & pagination ---
           # Fetch the last N DAYS (by time_at), not a row count. Paging stops as
           # soon as the cursor walks past the window, which is what keeps request
-          # volume low: most wallets need 1-2 pages instead of 10.
-          HISTORY_DAYS: '90'
+          # volume low. Measured on real wallets, the first 200-row page already
+          # reaches well past 90 days, so 180 usually costs no extra request.
+          # Full history is NOT an option here: 2000 rows is 10 pages = 11-20
+          # requests for ONE wallet, above the ~10-per-IP quota.
+          HISTORY_DAYS: '180'
           PAGE_COUNT: '2000'             # safety ceiling per wallet
           PAGE_SIZE: '200'               # rows per API request
           MAX_PAGES_PER_WALLET: '20'     # anti-runaway cap
