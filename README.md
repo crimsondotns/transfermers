@@ -63,11 +63,11 @@ Create a spreadsheet and share it with the service account email as **Editor**.
 
 For a single-tab setup, create the tab with headers in row 1:
 
-| A | B | C | D | E | F | ... | AI |
-|---|---|---|---|---|---|-----|-----|
-| cate_id | cex_id | chain | id | idx | is_scam | ... | recorded_at |
+| A | B | C | D | E | F | ... | AI | AJ | AK |
+|---|---|---|---|---|---|-----|-----|-----|-----|
+| cate_id | cex_id | chain | id | idx | is_scam | ... | recorded_at | transfer_idx | raw |
 
-**Or use the provided header template** (35 columns A:AI):
+**Or use the provided header template** (37 columns A:AK):
 
 ```
 cate_id | cex_id | chain | id | idx | is_scam | other_addr | project_id | 
@@ -76,8 +76,13 @@ send_amount | send_price | send_to_addr | send_token_id |
 time_at | approve_label | approve_spender | approve_token_id | approve_value | 
 tx_label | tx_eth_gas_fee | tx_from_addr | tx_id | tx_idx | 
 tx_message | tx_name | tx_params | tx_selector | tx_status | tx_to_addr | 
-tx_usd_gas_fee | tx_value | recorded_at
+tx_usd_gas_fee | tx_value | recorded_at | transfer_idx | raw
 ```
+
+> **Upgrading an existing sheet?** Nothing to do. A tab narrower than the header
+> is widened and its header rewritten on the next run — you cannot type into a
+> column the grid does not have, so this has to happen in code. Columns A–AI keep
+> their positions, so existing formulas and filters are unaffected.
 
 ---
 
@@ -313,21 +318,25 @@ request it has. What it *did* fetch is still saved:
 2. **Merge** them with the fresh rows. Wallets this run never reached keep their
    rows because their keys aren't in the fresh set. Rows older than `HISTORY_DAYS`
    are pruned so the tab can't grow forever.
-3. **ClearContent** — wipe `A2:AI`
+3. **ClearContent** — wipe `A2:AK`
 4. **Write** the merged set, newest first
 
-**The merge key is not the transaction id alone.** Rabby reports `cate_id` and the
-`receives`/`sends` fields *relative to the wallet being queried*, so one transfer
-between two wallets that are both in your list legitimately produces **two rows**:
+**The merge key is the digest of the `raw` column plus `transfer_idx`** — not the
+transaction id, and not a hand-picked set of flat fields. Guessing which columns
+make a row unique failed twice, because one transaction hash can legitimately
+become several rows:
 
-| Queried wallet | `cate_id` | `other_addr` |
+| Case | Rows | Why |
 |---|---|---|
-| the payer | `send` | the payee |
-| the payee | `receive` | the payer |
+| A transfer between two wallets you track | 2 | Rabby reports `cate_id` and `receives`/`sends` *relative to the wallet queried*: `send` from the payer's view, `receive` from the payee's |
+| An `exec` emitting several transfers | 1 per entry | The API returns one entry per transfer under the same hash, separated by `idx` |
+| A reward claim of 3 tokens | 3 | One entry whose `receives` array holds 3 elements |
+| A swap | 1 | One entry with a `sends` and a `receives` element, shown side by side |
 
-Both are correct and both are kept. The key combines the id with the direction
-fields (`cate_id`, `other_addr`, `recv_*`, `send_*`), so the two perspectives stay
-distinct while re-fetching the same wallet still replaces its own row in place.
+`raw` is the API object verbatim, so two rows differ exactly when their sources
+differ, and `transfer_idx` separates the sibling rows that share one source
+object. Re-fetching a wallet reproduces both parts exactly, so its rows are
+replaced in place rather than duplicated.
 
 A wallet that runs out of quota *mid-pagination* keeps the pages it already
 fetched, rather than discarding requests that were already spent.
@@ -379,8 +388,8 @@ get their own exponential backoff. Raise it if you increase `max-parallel`.
               │
               ▼
      ┌────────────────────────────────────┐
-     │ Map to 35-column row format        │
-     │ (cate_id, chain, amount, etc.)     │
+     │ Map to 37-column row format        │
+     │ one row per transfer in the tx     │
      └────────┬─────────────────────────────┘
               │
          ┌────┴────┐
@@ -428,8 +437,11 @@ volume — a typical wallet needs **1 request instead of 10**:
 | Quiet (nothing recent) | 1 page, 10 rows | 10 pages |
 | Very busy (1 tx/min) | 10 pages (hits the 2000 ceiling) | 10 pages |
 
-Rows are de-duplicated by transaction id (pages can overlap) and the whole batch
-is **sorted newest-first** before being written, so row 2 of the sheet is always
+Pages can overlap, so entries are de-duplicated on **`id` + `idx`** — not `id`
+alone. One hash can carry several history entries (that is exactly what `idx`
+distinguishes, and a contract call such as `exec` is the usual case); keying on
+the hash alone discarded every entry past the first before it reached the sheet.
+The whole batch is then **sorted newest-first**, so row 2 of the sheet is always
 the most recent transaction.
 
 **The loop cannot run away** — it stops on any of:
@@ -439,7 +451,7 @@ the most recent transaction.
 | 1 | `MAX_PAGES_PER_WALLET` hard cap (default 20) |
 | 2 | A page comes back empty |
 | 3 | A page is shorter than `PAGE_SIZE` (last page) |
-| 4 | A page contains no new transaction ids (API ignored the cursor) |
+| 4 | A page contains no new entries (API ignored the cursor) |
 | 5 | The cursor stops moving backwards in time |
 | 6 | `PAGE_COUNT` rows collected |
 | 7 | The global deadline — checked inside every page request |
@@ -628,11 +640,14 @@ re-shuffles which wallets land in which tab, so old tabs beyond the new count
 
 ## 📝 Output Format
 
-Each transaction becomes one row with 35 columns:
+Each **transfer** becomes one row with 37 columns. A transaction that moves a
+single token is one row, as before; one that moves several becomes one row per
+token, because `receives` and `sends` are arrays and reading only element `[0]`
+used to discard the rest.
 
 | Column | Field | Example |
 |--------|-------|---------|
-| A | cate_id | `"transfer"` |
+| A | cate_id | `"send"` |
 | B | cex_id | `null` |
 | C | chain | `"eth"` |
 | D | id | `"0xabc123..."` |
@@ -640,6 +655,23 @@ Each transaction becomes one row with 35 columns:
 | F | is_scam | `false` |
 | ... | ... | ... |
 | AI | recorded_at | `"08/14/2026 15:30:45"` |
+| AJ | transfer_idx | `0` |
+| AK | raw | `{"cate_id":"send",...}` |
+
+**`cate_id` is often empty** — Rabby only sets it for the send/receive/approve/
+cancel shapes. A contract call arrives with `cate_id: null`, so those rows have a
+blank column A and are easy to mistake for missing. `tx_name` (column AB) is where
+`exec`, `swap`, `approve` and friends show up. Nothing is filtered on either field:
+the only rows ever dropped are those the API flags `is_scam: true` and those
+outside `HISTORY_DAYS`.
+
+**`raw` (column AK)** holds the API object for that row verbatim. It is the row's
+source of truth: it keeps whatever the flat columns cannot express (every element
+of `receives`/`sends`, any field added upstream later), it lets a row be checked
+against the source without spending scarce request quota on a refetch, and its
+digest is what the merge keys on. Cells are capped at 49,000 characters to stay
+under Google's 50,000 limit; the rare oversized object is truncated with a
+warning in the log.
 
 ---
 

@@ -6,6 +6,7 @@ const https = require('https');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // ============================================================================
 // CONFIGURATION
@@ -910,10 +911,16 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
     }
 
     // Guard 4: count how many rows on this page we hadn't already seen.
+    //
+    // The key must include `idx`, not just the transaction id. One on-chain
+    // transaction can produce SEVERAL history entries under the same hash —
+    // that is exactly what `idx` distinguishes — and a contract call such as
+    // `exec` or `swap` is the usual case. Keying on the id alone dropped every
+    // entry past the first before it ever reached the sheet.
     let added = 0;
     let oldest = Infinity;
     for (const tx of list) {
-      const id = tx.id ?? `${tx.chain}:${tx.time_at}:${tx.idx}`;
+      const id = `${tx.id ?? `${tx.chain}:${tx.time_at}`}#${tx.idx ?? 0}`;
       if (!byId.has(id)) {
         byId.set(id, tx);
         added++;
@@ -979,7 +986,71 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
 // DATA MAPPING
 // ============================================================================
 
-function mapTransactionToRow(tx, walletAddr) {
+/** Google rejects a cell above 50,000 characters — stay clear of the ceiling. */
+const MAX_RAW_CELL_CHARS = 49000;
+
+/** Stable short digest of the raw JSON, used as the merge key. */
+function rawDigest(raw) {
+  return crypto.createHash('sha1').update(String(raw)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Serialise the API object verbatim for the `raw` column.
+ *
+ * This is the row's source of truth: every field the API returned survives here
+ * even when the flat columns cannot express it, so a mapping question can be
+ * answered from the sheet instead of by spending scarce request quota to refetch.
+ */
+function rawCell(tx) {
+  let raw;
+  try {
+    raw = JSON.stringify(tx);
+  } catch (err) {
+    log('WARN', `Could not serialise tx ${tx?.id}: ${err.message}`);
+    return null;
+  }
+  if (raw.length > MAX_RAW_CELL_CHARS) {
+    log('WARN', `Raw JSON for tx ${tx?.id} is ${raw.length} chars — truncated to ` +
+      `${MAX_RAW_CELL_CHARS} to fit a Sheets cell (no longer valid JSON)`);
+    return `${raw.slice(0, MAX_RAW_CELL_CHARS)}…[truncated]`;
+  }
+  return raw;
+}
+
+/**
+ * How many sheet rows one API object becomes.
+ *
+ * `receives` and `sends` are arrays: a swap holds one of each, a reward claim or
+ * a batch payout holds several. Only index [0] used to be read, so every entry
+ * past the first was silently discarded. Pairing them by index keeps a swap on a
+ * single row (send and receive side by side, as before) while giving a
+ * multi-token transaction the rows it needs.
+ */
+function transferRowCount(tx) {
+  const recv = Array.isArray(tx.receives) ? tx.receives.length : 0;
+  const sent = Array.isArray(tx.sends) ? tx.sends.length : 0;
+  return Math.max(recv, sent, 1);
+}
+
+/** Map one API object to all of its sheet rows (see transferRowCount). */
+function mapTransactionToRows(tx, walletAddr) {
+  const raw = rawCell(tx);
+  const total = transferRowCount(tx);
+  const rows = [];
+  for (let i = 0; i < total; i++) {
+    rows.push(mapTransactionToRow(tx, walletAddr, i, raw));
+  }
+  return rows;
+}
+
+/**
+ * Map the i-th transfer of one API object to a single sheet row.
+ *
+ * `transferIdx` selects which element of `receives`/`sends` fills the transfer
+ * columns; it is also written to the sheet (column AJ) because the merge key
+ * needs to tell sibling rows of one transaction apart after they are read back.
+ */
+function mapTransactionToRow(tx, walletAddr, transferIdx = 0, raw = undefined) {
   try {
     const cate_id = v(tx.cate_id);
     const cex_id = v(tx.cex_id);
@@ -991,15 +1062,17 @@ function mapTransactionToRow(tx, walletAddr) {
     const project_id = v(tx.project_id);
     const time_at = formatDateTH(tx.time_at);
 
-    const recv_amount = v(tx.receives?.[0]?.amount) ?? null;
-    const recv_from_addr = v(tx.receives?.[0]?.from_addr) ?? null;
-    const recv_price = v(tx.receives?.[0]?.price) ?? null;
-    const recv_token_id = v(tx.receives?.[0]?.token_id) ?? null;
+    const recv = tx.receives?.[transferIdx];
+    const recv_amount = v(recv?.amount) ?? null;
+    const recv_from_addr = v(recv?.from_addr) ?? null;
+    const recv_price = v(recv?.price) ?? null;
+    const recv_token_id = v(recv?.token_id) ?? null;
 
-    const send_amount = v(tx.sends?.[0]?.amount) ?? null;
-    const send_price = v(tx.sends?.[0]?.price) ?? null;
-    const send_to_addr = v(tx.sends?.[0]?.to_addr) ?? null;
-    const send_token_id = v(tx.sends?.[0]?.token_id) ?? null;
+    const sent = tx.sends?.[transferIdx];
+    const send_amount = v(sent?.amount) ?? null;
+    const send_price = v(sent?.price) ?? null;
+    const send_to_addr = v(sent?.to_addr) ?? null;
+    const send_token_id = v(sent?.token_id) ?? null;
 
     const approve = tx.token_approve || null;
     const approve_label = approve ? 'token_approve' : null;
@@ -1032,6 +1105,8 @@ function mapTransactionToRow(tx, walletAddr) {
       tx_message, tx_name, tx_params, tx_selector, tx_status, tx_to_addr,
       tx_usd_gas_fee, tx_value,
       null, // [34] recorded_at — filled during write
+      transferIdx,                                     // [35] transfer_idx
+      raw === undefined ? rawCell(tx) : raw,           // [36] raw
     ];
   } catch (err) {
     log('ERROR', `Mapping failed for wallet ${maskAddr(walletAddr)}: ${err.message}`);
@@ -1096,7 +1171,58 @@ const SHEET_HEADER = [
   'tx_label', 'tx_eth_gas_fee', 'tx_from_addr', 'tx_id', 'tx_idx',
   'tx_message', 'tx_name', 'tx_params', 'tx_selector', 'tx_status', 'tx_to_addr',
   'tx_usd_gas_fee', 'tx_value', 'recorded_at',
+  'transfer_idx', 'raw',
 ];
+
+// Last column letter of the header, used in every A1 range below so the ranges
+// cannot drift out of sync with SHEET_HEADER when a column is added.
+const LAST_COL = (() => {
+  let n = SHEET_HEADER.length; // 1-based
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+})();
+const DATA_RANGE = `A2:${LAST_COL}`;
+
+/** True when a row carries the `raw` column, i.e. it was written by this version. */
+function hasRaw(row) {
+  return row[36] != null && String(row[36]) !== '';
+}
+
+/**
+ * Merge key for a sheet row.
+ *
+ * `raw` is the API object verbatim, so its digest separates any two rows the API
+ * itself considers different — including the payer's and the payee's view of one
+ * transfer, which share a transaction id. `transfer_idx` separates the sibling
+ * rows that one multi-token transaction expands into, since those do share a
+ * source object. Re-fetching a wallet reproduces both parts exactly, so its rows
+ * are replaced rather than duplicated.
+ */
+function keyOf(row) {
+  if (!hasRaw(row)) return legacyKeyOf(row);
+  return `h:${rawDigest(row[36])}#${row[35] ?? 0}`;
+}
+
+/**
+ * The pre-`raw` merge key, kept only to recognise rows written by earlier
+ * versions during the one-time migration in writeToSheet.
+ */
+function legacyKeyOf(row) {
+  return 'l:' + [
+    row[3] || `${row[2]}:${row[16]}:${row[4]}`, // id (or a composite fallback)
+    row[0],   // cate_id
+    row[6],   // other_addr
+    row[8],   // recv_amount
+    row[9],   // recv_from_addr
+    row[12],  // send_amount
+    row[14],  // send_to_addr
+  ].map((val) => (val == null ? '' : String(val))).join('|');
+}
 
 /** Look up a tab's sheetId + current grid size, or null when it doesn't exist. */
 async function findSheetProps(sheets, sheetName) {
@@ -1119,7 +1245,7 @@ async function ensureSheetTab(sheets, sheetName) {
   const existing = await withRetry(
     () => findSheetProps(sheets, sheetName), `Look up tab "${sheetName}"`);
 
-  if (existing) return existing;
+  if (existing) return widenSheetTab(sheets, existing, sheetName);
 
   log('INFO', `Tab "${sheetName}" not found — creating it`);
   try {
@@ -1153,7 +1279,54 @@ async function ensureSheetTab(sheets, sheetName) {
   const props = await withRetry(
     () => findSheetProps(sheets, sheetName), `Re-read tab "${sheetName}"`);
   if (!props) throw new Error(`Sheet tab "${sheetName}" could not be created or found`);
-  return props;
+  return widenSheetTab(sheets, props, sheetName);
+}
+
+/**
+ * Grow a tab that is narrower than SHEET_HEADER, and refresh its header row.
+ *
+ * A tab created before a column was added keeps its old `columnCount`, and every
+ * write wider than that grid fails outright with "exceeds grid limits". The
+ * manual workaround is not even possible — you cannot type into a column the
+ * grid does not have — so this has to happen in code. No spreadsheet edit is
+ * needed to pick up new columns.
+ */
+async function widenSheetTab(sheets, props, sheetName) {
+  const width = props.gridProperties?.columnCount || 0;
+  if (width >= SHEET_HEADER.length) return props;
+
+  log('INFO', `Tab "${sheetName}" is ${width} columns wide but the header needs ` +
+    `${SHEET_HEADER.length} — widening it`);
+
+  await withRetry(() => sheets.spreadsheets.batchUpdate({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    resource: {
+      requests: [{
+        updateSheetProperties: {
+          properties: {
+            sheetId: props.sheetId,
+            gridProperties: { columnCount: SHEET_HEADER.length },
+          },
+          fields: 'gridProperties.columnCount',
+        },
+      }],
+    },
+  }), `Widen tab "${sheetName}"`);
+
+  await withRetry(() => sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    range: `${sheetName}!A1`,
+    valueInputOption: 'RAW',
+    resource: { values: [SHEET_HEADER] },
+  }), `Rewrite header of "${sheetName}"`);
+
+  log('OK', `Widened "${sheetName}" ${width} → ${SHEET_HEADER.length} columns ` +
+    `(A–${LAST_COL}) and refreshed the header row`);
+
+  return {
+    ...props,
+    gridProperties: { ...props.gridProperties, columnCount: SHEET_HEADER.length },
+  };
 }
 
 /**
@@ -1165,9 +1338,9 @@ async function ensureSheetTab(sheets, sheetName) {
 async function clearSheetContent(sheets, sheetName) {
   await withRetry(() => sheets.spreadsheets.values.clear({
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
-    range: `${sheetName}!A2:AI`,
+    range: `${sheetName}!${DATA_RANGE}`,
   }), `Clear content of "${sheetName}"`);
-  log('OK', `ClearContent: wiped "${sheetName}" A2:AI before writing`);
+  log('OK', `ClearContent: wiped "${sheetName}" ${DATA_RANGE} before writing`);
 }
 
 /**
@@ -1208,25 +1381,25 @@ async function writeToSheet(rows, sheetName) {
   // keep their rows because their keys are not in the fresh set, and rows that
   // aged out of the look-back window are dropped so the tab cannot grow forever.
   //
-  // The key is NOT the transaction id alone. Rabby reports cate_id and the
-  // receives/sends fields relative to the wallet being queried, so one on-chain
-  // transfer between two wallets that are both in the list legitimately produces
-  // TWO rows — 'send' from the payer's view and 'receive' from the payee's — that
-  // share an id. Keying on the id alone silently dropped one of them. Including
-  // the direction fields keeps both while still letting a re-fetch of the same
-  // wallet replace its own previous row.
-  const keyOf = (row) => [
-    row[3] || `${row[2]}:${row[16]}:${row[4]}`, // id (or a composite fallback)
-    row[0],   // cate_id      — send / receive
-    row[6],   // other_addr   — the counterparty from this wallet's side
-    row[8],   // recv_amount
-    row[9],   // recv_from_addr
-    row[12],  // send_amount
-    row[14],  // send_to_addr
-  ].map((v) => (v == null ? '' : String(v))).join('|');
+  // The key is the digest of the `raw` column plus `transfer_idx`. Guessing which
+  // flat fields make a row unique has now failed twice — first on the transaction
+  // id alone (which collapsed the payer's and the payee's view of one transfer),
+  // then on a hand-picked set of direction fields (which still could not separate
+  // two identical-amount transfers). The raw JSON is the API's own answer to that
+  // question: two rows differ exactly when their source objects differ, and
+  // transfer_idx separates the sibling rows that share one source object.
   const merged = new Map(fresh.map((row) => [keyOf(row), row]));
   let carried = 0;
   let expired = 0;
+  let superseded = 0;
+
+  // Rows written before the `raw` column existed cannot be keyed that way, so
+  // they keep the old composite key and are matched against the equivalent key
+  // built from each fresh row. A legacy row whose key a fresh row claims has
+  // been re-fetched and is dropped; the rest are carried over untouched. Without
+  // this the two key spaces would never intersect and the first run after the
+  // upgrade would write every row twice.
+  const claimedLegacy = new Set(fresh.map(legacyKeyOf));
 
   const cutoffMs = RATE_LIMIT_CONFIG.HISTORY_DAYS > 0
     ? Date.now() - RATE_LIMIT_CONFIG.HISTORY_DAYS * 86400000
@@ -1234,12 +1407,16 @@ async function writeToSheet(rows, sheetName) {
 
   const existing = await withRetry(() => sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
-    range: `${sheetName}!A2:AI`,
+    range: `${sheetName}!${DATA_RANGE}`,
   }), `Read existing rows from "${sheetName}"`);
 
   for (const row of existing.data.values || []) {
     const key = keyOf(row);
     if (merged.has(key)) continue;                       // refreshed this run
+    if (!hasRaw(row) && claimedLegacy.has(legacyKeyOf(row))) {
+      superseded++;                                      // legacy row, re-fetched
+      continue;
+    }
     if (cutoffMs && parseDateTH(row[16]) < cutoffMs) {    // outside the window now
       expired++;
       continue;
@@ -1248,9 +1425,10 @@ async function writeToSheet(rows, sheetName) {
     carried++;
   }
 
-  if (carried || expired) {
+  if (carried || expired || superseded) {
     log('INFO', `Merged with "${sheetName}": ${c.bold(fresh.length)} fetched, ` +
       `${c.bold(carried)} kept from previous runs` +
+      (superseded ? `, ${superseded} pre-raw row(s) superseded` : '') +
       (expired ? `, ${expired} aged out of the window` : ''));
   }
 
@@ -1373,7 +1551,7 @@ async function appendToSheet(rows, sheetName) {
 
     await withRetry(() => sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: `${sheetName}!A2:AI`,
+      range: `${sheetName}!${DATA_RANGE}`,
       valueInputOption: 'RAW',
       resource: { values: chunk },
     }), `Append chunk ${chunkNum}/${totalChunks}`);
@@ -1505,8 +1683,12 @@ async function processTransactions() {
       for (const tx of filtered) {
         try {
           // Keep the numeric timestamp alongside the row so every wallet's rows
-          // can be merged and sorted newest-first before the write.
-          collected.push({ timeAt: Number(tx.time_at) || 0, row: mapTransactionToRow(tx, addr) });
+          // can be merged and sorted newest-first before the write. One tx can
+          // expand to several rows when it moves more than one token.
+          const timeAt = Number(tx.time_at) || 0;
+          for (const row of mapTransactionToRows(tx, addr)) {
+            collected.push({ timeAt, row });
+          }
         } catch (mapErr) {
           log('WARN', `Mapping error for tx ${tx.id}: ${mapErr.message}`);
         }
@@ -1635,7 +1817,7 @@ async function runManualMode(walletAddress) {
   const rows = [];
   for (const tx of filtered) {
     try {
-      rows.push(mapTransactionToRow(tx, addr));
+      rows.push(...mapTransactionToRows(tx, addr));
     } catch (mapErr) {
       log('WARN', `Mapping error for tx ${tx.id}: ${mapErr.message}`);
     }
@@ -1767,6 +1949,9 @@ module.exports = {
   fetchTransactions,
   fetchHistoryPage,
   clearSheetContent,
+  writeToSheet,
+  ensureSheetTab,
+  widenSheetTab,
   resolveProxyUrl,
   isProxyExempt,
   maskProxy,
@@ -1779,7 +1964,15 @@ module.exports = {
   resolveBatch,
   resolveSheetName,
   SHEET_HEADER,
+  LAST_COL,
+  DATA_RANGE,
   mapTransactionToRow,
+  mapTransactionToRows,
+  transferRowCount,
+  keyOf,
+  legacyKeyOf,
+  hasRaw,
+  rawDigest,
   maskAddr,
   RATE_LIMIT_CONFIG,
 };
