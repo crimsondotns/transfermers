@@ -123,7 +123,7 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `MAX_TIMEOUT_RETRIES` — Max retries for timeouts (default: `5`)
 - `CHUNK_SIZE` — Rows per Google Sheets write (default: `500`)
 - `MAX_REQUESTS_PER_RUN` — Hard cap on API requests per run (default: `8`) — **the key setting**
-- `MIN_SUCCESS_RATIO` — Share of a batch that must succeed before the tab is rewritten (default: `1`)
+- `MIN_SUCCESS_RATIO` — Share of a batch that must succeed before results are written (default: `0`; writes merge, so partial results are safe)
 - `HTTP_USER_AGENT` — Override the request User-Agent (optional)
 
 See `config/example.env` for full template.
@@ -304,20 +304,30 @@ secret unset to send traffic directly — nothing changes.
 > Note: a custom `httpsAgent` makes axios ignore the proxy environment variables,
 > so the agent itself is built as a tunnelling agent when a proxy is configured.
 
-### Partial runs never overwrite a tab
+### Nothing fetched is ever thrown away
 
-Each tab is rewritten in full, and rows carry no wallet identity, so a run that
-reached only some of its wallets cannot keep the rest of the history.
-`MIN_SUCCESS_RATIO` decides what happens:
+A run can end early — the request quota runs out, or one busy wallet needs every
+request it has. What it *did* fetch is still saved:
 
-| Value | Behaviour |
-|---|---|
-| **`1`** (default) | Rewrite only when **every** wallet in the batch succeeded. A partial run writes nothing and the previous contents stay. |
-| `0.5` | Rewrite from half a batch — the wallets that failed lose their rows. |
+1. **Read** the rows already in the tab
+2. **Merge** them with the fresh rows, keyed on the **transaction id (column D)**.
+   Wallets this run never reached keep their rows: their transaction ids simply
+   aren't in the fresh set. Rows older than `HISTORY_DAYS` are pruned so the tab
+   can't grow forever.
+3. **ClearContent** — wipe `A2:AI`
+4. **Write** the merged set, newest first
 
-With `MAX_REQUESTS_PER_RUN` sized to the batch, a run normally completes all of
-its wallets, so the tab refreshes every time. When it doesn't, the previous
-snapshot is kept and the next run tries again.
+No extra column is needed: every row already carries a unique transaction id.
+
+A wallet that runs out of quota *mid-pagination* keeps the pages it already
+fetched, rather than discarding requests that were already spent.
+
+Combined with wallet rotation, coverage builds up across runs:
+
+```
+run 1:  busy wallet uses the whole quota  ->  its rows saved, 2 wallets skipped
+run 2:  rotation starts elsewhere         ->  those 2 added, run 1's rows kept
+```
 
 ### Google Sheets write quota
 

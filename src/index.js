@@ -290,10 +290,9 @@ const RATE_LIMIT_CONFIG = {
   // Safety guard: the sheet is a full-refresh snapshot, so writing a mostly-empty
   // result would destroy a good previous snapshot. Require this share of wallets
   // to have succeeded before the destructive clear+write is allowed.
-  // Share of a batch that must succeed before the tab is rewritten. With small
-  // batches and no per-wallet identity in the sheet, 1.0 (the whole batch) is the
-  // only value that cannot silently drop a wallet's history.
-  MIN_SUCCESS_RATIO: parseFloat(process.env.MIN_SUCCESS_RATIO || '1'),
+  // Share of a batch that must succeed before its results are written. Writes
+  // merge on transaction id, so partial results are additive and 0 is safe.
+  MIN_SUCCESS_RATIO: parseFloat(process.env.MIN_SUCCESS_RATIO || '0'),
 };
 
 // Honest client headers — we identify as a normal HTTP/JSON client and rely on
@@ -884,8 +883,24 @@ async function fetchTransactions(walletAddress, rateLimitMgr) {
       ? undefined
       : cfg.PAGE_DELAY_MIN_MS +
         Math.random() * Math.max(0, cfg.PAGE_DELAY_MAX_MS - cfg.PAGE_DELAY_MIN_MS);
-    const { list, attempts: pageAttempts } =
-      await fetchHistoryPage(walletAddress, cursor, rateLimitMgr, budget, spacingMs);
+    let list, pageAttempts;
+    try {
+      ({ list, attempts: pageAttempts } =
+        await fetchHistoryPage(walletAddress, cursor, rateLimitMgr, budget, spacingMs));
+    } catch (err) {
+      // Running out of request quota or time part-way through a wallet used to
+      // discard every page already fetched — requests we had already spent. Keep
+      // them: an incomplete but real slice of history beats nothing. With nothing
+      // collected yet there is nothing to salvage, so the error propagates and
+      // the caller counts the wallet as skipped.
+      if ((err instanceof BudgetError || err instanceof DeadlineError) && byId.size > 0) {
+        log('WARN', `${masked}: ${err.message} after ${page - 1} page(s) — ` +
+          `keeping the ${c.bold(byId.size)} row(s) already fetched`);
+        stopReason = `partial: ${err.message}`;
+        break;
+      }
+      throw err;
+    }
     attempts += pageAttempts;
 
     // Guard 2: the history is exhausted.
@@ -1142,6 +1157,20 @@ async function ensureSheetTab(sheets, sheetName) {
 }
 
 /**
+ * Clear every data row (A2 down), leaving the header intact.
+ *
+ * Always call this immediately before writing a new set, and only after any
+ * existing rows that must be preserved have already been read.
+ */
+async function clearSheetContent(sheets, sheetName) {
+  await withRetry(() => sheets.spreadsheets.values.clear({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    range: `${sheetName}!A2:AI`,
+  }), `Clear content of "${sheetName}"`);
+  log('OK', `ClearContent: wiped "${sheetName}" A2:AI before writing`);
+}
+
+/**
  * Write rows to the sheet by OVERWRITING in place (values.update), not appending.
  *
  * The previous implementation used append + INSERT_ROWS, which inserts brand-new
@@ -1168,12 +1197,51 @@ async function writeToSheet(rows, sheetName) {
   const sheetId = props.sheetId;
   const currentRowCount = props.gridProperties?.rowCount || 1000;
 
-  // Stamp recorded_at (column AI / index 34) on every row, then sort newest-first.
+  // Stamp recorded_at (column AI / index 34) on every freshly fetched row.
   const recordedAt = getCurrentTimestampTH();
-  const values = rows.map((row) => {
+  const fresh = rows.map((row) => {
     row[34] = recordedAt;
     return row;
   });
+
+  // Merge with whatever is already in the tab, keyed on the transaction id in
+  // column D. Every row already carries a unique id, so wallets this run did not
+  // reach keep their rows without needing any extra column: their transaction ids
+  // simply are not in the fresh set. Rows that aged out of the look-back window
+  // are dropped, so the tab cannot grow forever.
+  const keyOf = (row) => String(row[3] || `${row[2]}:${row[16]}:${row[4]}`);
+  const merged = new Map(fresh.map((row) => [keyOf(row), row]));
+  let carried = 0;
+  let expired = 0;
+
+  const cutoffMs = RATE_LIMIT_CONFIG.HISTORY_DAYS > 0
+    ? Date.now() - RATE_LIMIT_CONFIG.HISTORY_DAYS * 86400000
+    : 0;
+
+  const existing = await withRetry(() => sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    range: `${sheetName}!A2:AI`,
+  }), `Read existing rows from "${sheetName}"`);
+
+  for (const row of existing.data.values || []) {
+    const key = keyOf(row);
+    if (merged.has(key)) continue;                       // refreshed this run
+    if (cutoffMs && parseDateTH(row[16]) < cutoffMs) {    // outside the window now
+      expired++;
+      continue;
+    }
+    merged.set(key, row);
+    carried++;
+  }
+
+  if (carried || expired) {
+    log('INFO', `Merged with "${sheetName}": ${c.bold(fresh.length)} fetched, ` +
+      `${c.bold(carried)} kept from previous runs` +
+      (expired ? `, ${expired} aged out of the window` : ''));
+  }
+
+  const values = [...merged.values()]
+    .sort((a, b) => parseDateTH(b[16]) - parseDateTH(a[16]));
 
   if (values.length === 0) {
     log('WARN', `Nothing to write to "${sheetName}" after merge — leaving it untouched`);
@@ -1198,12 +1266,10 @@ async function writeToSheet(rows, sheetName) {
     }), 'Grow sheet rows');
   }
 
-  // 2) Clear old values under the header.
-  await withRetry(() => sheets.spreadsheets.values.clear({
-    spreadsheetId: GOOGLE_SPREADSHEET_ID,
-    range: `${sheetName}!A2:AI`,
-  }), `Clear tab "${sheetName}"`);
-  log('OK', `Cleared previous values in "${sheetName}" (A2:AI)`);
+  // 2) Wipe every existing data row before writing the new set. This runs AFTER
+  //    the merge read above, so nothing that needs preserving is lost, and it
+  //    guarantees no stale row can survive below the rows we are about to write.
+  await clearSheetContent(sheets, sheetName);
 
   // 3) Overwrite in place, chunked (values.update — never inserts rows).
   const totalChunks = Math.ceil(values.length / RATE_LIMIT_CONFIG.CHUNK_SIZE);
@@ -1253,7 +1319,8 @@ async function writeToSheet(rows, sheetName) {
     log('OK', `Trimmed grid ${rowCountNow} → ${targetRowCount} rows (reclaimed cells)`);
   }
 
-  log('OK', `Successfully wrote ${c.bold(values.length)} rows to "${sheetName}"`);
+  log('OK', `Successfully wrote ${c.bold(values.length)} rows to "${sheetName}"` +
+    (carried ? ` (${fresh.length} fresh + ${carried} kept)` : ''));
   return values.length;
 }
 
@@ -1477,9 +1544,9 @@ async function processTransactions() {
       `${c.cyan(formatDateTH(collected[0].timeAt))} → ${c.cyan(formatDateTH(collected[collected.length - 1].timeAt))}`);
   }
 
-  // The write is a full refresh of the tab and rows carry no wallet identity, so
-  // a partial run would silently drop the missing wallets' history. Only rewrite
-  // when enough of the batch succeeded; otherwise keep the previous snapshot.
+  // Writes merge on transaction id, so a partial run only ever adds rows — the
+  // wallets it missed keep theirs. MIN_SUCCESS_RATIO therefore defaults to 0 and
+  // exists only for anyone who wants to hold back partial results anyway.
   const successRatio = wallets.length ? okCount / wallets.length : 0;
   if (okCount > 0 && successRatio < RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO) {
     log('WARN', `${c.bold('Sheet NOT updated')} — only ${okCount}/${wallets.length} wallets succeeded ` +
@@ -1685,6 +1752,7 @@ module.exports = {
   fetchBudgetRemainingMs,
   fetchTransactions,
   fetchHistoryPage,
+  clearSheetContent,
   resolveProxyUrl,
   isProxyExempt,
   maskProxy,
