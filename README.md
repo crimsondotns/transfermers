@@ -1,6 +1,8 @@
-# 🚀 Rabby Transaction Tracker — GitHub Actions Edition
+# 🚀 Transaction Tracker — GitHub Actions Edition
 
-Track cryptocurrency transaction history from [Rabby Wallet](https://rabby.io) and automatically sync to Google Sheets with **proper rate limit handling** and graceful error recovery.
+Track on-chain wallet transaction history from a JSON history API and automatically sync it to Google Sheets, with **proper rate limit handling** and graceful error recovery.
+
+The upstream endpoint is **not** hard-coded — it comes from the `HISTORY_API_URL` secret, so this repository does not identify the service it calls.
 
 Designed specifically for **GitHub Actions** — no local setup required, runs on schedule, respects API rate limits.
 
@@ -39,6 +41,7 @@ Add these **Repository Secrets** in GitHub Settings → Secrets and variables �
 
 | Secret Name | Value |
 |---|---|
+| `HISTORY_API_URL` | The upstream history endpoint. **Required** — there is no default in the source |
 | `WALLET_LIST` | Comma-separated wallet addresses: `0x123...,0xabc...` |
 | `GOOGLE_SPREADSHEET_ID` | Found in sheet URL: `docs.google.com/spreadsheets/d/{ID}/edit` |
 | `GOOGLE_SHEET_NAME` | Sheet tab name (default: `Sheet1`) |
@@ -93,6 +96,7 @@ tx_usd_gas_fee | tx_value | recorded_at | transfer_idx | raw | suspect | wallet_
 All can be configured in `.env` file for local testing, or via GitHub Secrets for Actions.
 
 **Required:**
+- `HISTORY_API_URL` — Upstream history endpoint (kept out of the source on purpose; the run fails fast if it is unset)
 - `WALLET_LIST` — Comma-separated wallet addresses
 - `GOOGLE_SPREADSHEET_ID` — Google Sheet ID
 - `GOOGLE_CREDENTIALS` — Service account JSON
@@ -153,7 +157,7 @@ schedule:
 
 Trigger manually:
 1. Go to **Actions** tab
-2. Select **Rabby Transaction Sync** workflow
+2. Select **Transaction Sync** workflow
 3. Click **Run workflow** — no inputs; the split comes from `BATCH_TOTAL`
 
 ### Running batches by hand
@@ -244,7 +248,7 @@ env:
   BATCH_TOTAL: '50'                          # must equal the matrix length
 strategy:
   fail-fast: false                           # one blocked batch ≠ cancel the rest
-  max-parallel: 1                            # be polite to Rabby
+  max-parallel: 1                            # be polite to the upstream
   matrix:
     batch: [1,2,3, … ,50]
 ```
@@ -273,7 +277,7 @@ wallets up on a later run, and writes merge rather than replace. It just means a
 single run is not a complete snapshot.
 
 - `fail-fast: false` matters: without it, one blocked batch cancels all the others
-- **Lower `max-parallel`** → gentler on Rabby. A measured run got a 429 after 10
+- **Lower `max-parallel`** → gentler on the upstream. A measured run got a 429 after 10
   requests in 149s (~4 req/min), so `1` is the safe setting. Raising it to `2`
   roughly halves the wall time and is worth testing if 100 minutes is too long —
   watch for 403s coming back.
@@ -354,7 +358,7 @@ become several rows:
 
 | Case | Rows | Why |
 |---|---|---|
-| A transfer between two wallets you track | 2 | Rabby reports `cate_id` and `receives`/`sends` *relative to the wallet queried*: `send` from the payer's view, `receive` from the payee's |
+| A transfer between two wallets you track | 2 | The API reports `cate_id` and `receives`/`sends` *relative to the wallet queried*: `send` from the payer's view, `receive` from the payee's |
 | An `exec` emitting several transfers | 1 per entry | The API returns one entry per transfer under the same hash, separated by `idx` |
 | A reward claim of 3 tokens | 3 | One entry whose `receives` array holds 3 elements |
 | A swap | 1 | One entry with a `sends` and a `receives` element, shown side by side |
@@ -412,7 +416,7 @@ get their own exponential backoff. Raise it if you increase `max-parallel`.
               │
               ▼
      ┌──────────────────────────────────┐
-     │ Fetch from Rabby API with retry  │
+     │ Fetch from history API w/ retry  │
      │ (rate limit aware)               │
      └────────┬─────────────────────────┘
               │
@@ -572,11 +576,12 @@ spirit of the API's limits. Two honest options actually fix it:
    The adaptive cooldown above is the fix. If it still happens: raise `JITTER_MIN_MS`,
    lower the cron frequency (e.g. `*/30` or hourly), or split wallets across more runs.
 
-2. **Use the official DeBank Cloud API (the legitimate "other endpoint").** Rabby's
-   history is powered by DeBank. Their supported product, **DeBank Cloud
-   (`pro.openapi.debank.com`)**, gives you an `AccessKey`, documented rate limits, and no
-   bot-blocking — it's built to be called from servers like CI. That's the right path if
-   you need reliable, higher-volume access. It's a paid/credits API, so it's opt-in.
+2. **Move to your provider's supported commercial API.** Most wallet-history
+   services that soft-block CI traffic also sell a server-side product with an
+   access key, documented rate limits and no bot-blocking — built to be called
+   from exactly this kind of job. That's the right path if you need reliable,
+   higher-volume access. It is normally a paid/credits API, so it is opt-in:
+   point `HISTORY_API_URL` at it and add the key to the request headers.
 
 > ⚠️ Spoofing browser fingerprints, rotating proxies, or driving a headless browser to
 > evade the block are **not** supported here by design — they break easily and abuse the
@@ -586,7 +591,7 @@ spirit of the API's limits. Two honest options actually fix it:
 
 ## 🎣 Address poisoning (the dust the scam filter misses)
 
-Rabby returns these with **`is_scam: false`**, so the scam filter never sees them.
+The API returns these with **`is_scam: false`**, so the scam filter never sees them.
 The attack works like this:
 
 1. You pay a counterparty, say `0x42a8895f…386d328e`
@@ -640,7 +645,7 @@ set `DROP_SUSPECTED=1` to have the `dust_relayed` rows discarded before the writ
 **Cause**: Request is being blocked (possible rate limit, user-agent detection)
 
 **Solutions**:
-- ✅ Check Rabby API status
+- ✅ Check the upstream API status
 - ✅ Add cookie if required (not currently supported in GitHub Actions)
 - ✅ Increase backoff: increase `JITTER_MIN_MS`
 
@@ -665,7 +670,7 @@ set `DROP_SUSPECTED=1` to have the `dust_relayed` rows discarded before the writ
 ### Workflow fails silently
 
 **Debug**:
-1. Go to **Actions** → **Rabby Transaction Sync** workflow
+1. Go to **Actions** → **Transaction Sync** workflow
 2. Click on the failed run
 3. Expand **Run transaction sync** step
 4. Look for error messages in logs
@@ -743,7 +748,7 @@ money appears nowhere in the response, so without this column a row cannot be
 attributed to one of your wallets — and two wallets receiving the identical
 amount in one transaction produce byte-identical objects that would collide.
 
-**`cate_id` is often empty** — Rabby only sets it for the send/receive/approve/
+**`cate_id` is often empty** — the API only sets it for the send/receive/approve/
 cancel shapes. A contract call arrives with `cate_id: null`, so those rows have a
 blank column A and are easy to mistake for missing. `tx_name` (column AB) is where
 `exec`, `swap`, `approve` and friends show up. Nothing is filtered on either field:
@@ -780,7 +785,7 @@ warning in the log.
 **Rate limit concerns?**
 - Review rate limit strategy above
 - Adjust config vars
-- Contact Rabby support if API is blocking requests
+- Contact the API provider's support if requests are being blocked
 
 ---
 
@@ -795,7 +800,7 @@ MIT — Feel free to fork, modify, use in your projects
 ### Monitor in real-time
 ```bash
 # Watch workflow runs
-watch -n 5 'gh run list --workflow rabby-sync.yml | head -20'
+watch -n 5 'gh run list --workflow sync.yml | head -20'
 ```
 
 ### Test locally before committing

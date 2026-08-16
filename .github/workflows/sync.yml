@@ -1,4 +1,4 @@
-name: Rabby Transaction Sync
+name: Transaction Sync
 
 on:
   schedule:
@@ -75,6 +75,9 @@ jobs:
 
       - name: Run transaction sync (batch ${{ matrix.batch }})
         env:
+          # --- Upstream endpoint: kept out of the source, see README ---
+          HISTORY_API_URL: ${{ secrets.HISTORY_API_URL }}
+
           # --- Wallets: one secret holds all 200+, the script slices this batch out ---
           WALLET_LIST: ${{ secrets.WALLET_LIST }}
 
@@ -102,7 +105,7 @@ jobs:
           PAGE_DELAY_MAX_MS: '2000'
 
           # --- Address-poisoning detection ---
-          # Rabby reports these with is_scam:false, so the scam filter misses
+          # The upstream reports these with is_scam:false, so the scam filter misses
           # them. A transfer worth less than this in USD that arrived from a
           # relayer rather than its stated sender is flagged in the `suspect`
           # column (AL). Rows are FLAGGED, not removed — set DROP_SUSPECTED to

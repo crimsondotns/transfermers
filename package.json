@@ -1,14 +1,13 @@
 {
-  "name": "rabby-transaction-tracker",
+  "name": "transaction-tracker",
   "version": "1.0.0",
-  "description": "Track Rabby wallet transactions and sync to Google Sheets with rate limit handling",
+  "description": "Track on-chain wallet transactions and sync them to Google Sheets, with rate limit handling",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
-    "rabby",
     "crypto",
     "blockchain",
     "transaction",

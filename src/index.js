@@ -12,7 +12,10 @@ const crypto = require('crypto');
 // CONFIGURATION
 // ============================================================================
 
-const RABBY_API_URL = 'https://api.rabby.io/v1/user/history_all_list';
+// The upstream history endpoint is configuration, not source. Set it as a
+// repository secret (and in .env for local runs); there is deliberately no
+// fallback baked in, so the URL never appears in this file.
+const HISTORY_API_URL = process.env.HISTORY_API_URL || '';
 const GOOGLE_SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
 const GOOGLE_SHEET_NAME = process.env.GOOGLE_SHEET_NAME || 'Sheet1';
 const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS || '{}';
@@ -64,7 +67,7 @@ function parseArgs(argv) {
 const CLI = parseArgs(process.argv.slice(2));
 
 const HELP_TEXT = `
-Rabby transaction sync — fetches wallet history and writes it to Google Sheets.
+Transaction sync — fetches wallet history and writes it to Google Sheets.
 
 Usage:
   node src/index.js [options]
@@ -259,7 +262,7 @@ const RATE_LIMIT_CONFIG = {
   WRITE_RESERVE_MS: num('WRITE_RESERVE_MS', 90000),
 
   // --- History depth & pagination ---
-  // Rabby caps how many rows one history_all_list response can return, so asking
+  // The API caps how many rows one history response can return, so asking
   // for 2000 in a single request silently truncates the history. We instead page
   // through with `start_time` (the oldest time_at seen so far) as the cursor and
   // accumulate up to MAX_TX_PER_WALLET rows.
@@ -353,7 +356,7 @@ function resolveProxyUrl(targetUrl) {
     null;
 }
 
-const PROXY_URL = resolveProxyUrl(RABBY_API_URL);
+const PROXY_URL = resolveProxyUrl(HISTORY_API_URL);
 const HTTPS_AGENT = PROXY_URL
   ? new HttpsProxyAgent(PROXY_URL, AGENT_OPTIONS)
   : new https.Agent(AGENT_OPTIONS);
@@ -694,7 +697,7 @@ async function fetchHistoryPage(walletAddress, startTime, rateLimitMgr, budget, 
     page_count: String(cfg.PAGE_SIZE),
   });
   if (startTime > 0) params.set('start_time', String(startTime));
-  const url = `${RABBY_API_URL}?${params.toString()}`;
+  const url = `${HISTORY_API_URL}?${params.toString()}`;
 
   let timeoutRetries = 0;
   let pendingRounds = 0;  // how many times the API said "job pending"
@@ -1215,7 +1218,7 @@ function hasWallet(row) {
 // ---------------------------------------------------------------------------
 // Address-poisoning detection
 // ---------------------------------------------------------------------------
-// Rabby reports these with `is_scam: false`, so the scam filter never sees them.
+// The API reports these with `is_scam: false`, so the scam filter never sees them.
 // The attack: send a dust transfer from an address generated to share the first
 // and last few characters of one you really deal with, so the look-alike lands
 // in your history and you copy it by mistake next time you pay that counterparty.
@@ -1748,6 +1751,10 @@ async function processTransactions() {
   if (!GOOGLE_SPREADSHEET_ID) {
     throw new Error('GOOGLE_SPREADSHEET_ID not configured');
   }
+  if (!HISTORY_API_URL) {
+    throw new Error('HISTORY_API_URL not configured — set it as a repository ' +
+      'secret, or in .env for local runs');
+  }
 
   const scope = batch
     ? `${c.bold(`batch ${batch.index}/${batch.total}`)} — wallets ` +
@@ -1962,6 +1969,11 @@ async function runManualMode(walletAddress) {
 
   log('INFO', `${c.bold('Manual retry mode')} — ${c.magenta(masked)} → tab ${c.cyan(sheetName)} ` +
     `${c.dim('(append only, tab not cleared)')}`);
+
+  if (!HISTORY_API_URL) {
+    throw new Error('HISTORY_API_URL not configured — set it as a repository ' +
+      'secret, or in .env for local runs');
+  }
 
   const rateLimitMgr = new RateLimitManager();
   const { list: rawList, attempts, pages } = await fetchTransactions(addr, rateLimitMgr);
