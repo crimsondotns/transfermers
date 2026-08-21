@@ -25,6 +25,13 @@ env:
   # and therefore a fresh quota, so raising MAX_REQUESTS_PER_RUN would not help.
   BATCH_TOTAL: '50'
 
+  # The one tab everything ends up in. The Batch_NN tabs are scratch space that
+  # the consolidate job below folds into this and then deletes, so the
+  # spreadsheet keeps a single sheet however large BATCH_TOTAL grows.
+  # It is created on first use, so no spreadsheet edit is needed; set the
+  # MASTER_SHEET_NAME secret to point it at a tab you already have instead.
+  MASTER_SHEET_NAME: ${{ secrets.MASTER_SHEET_NAME || 'Transactions' }}
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -171,3 +178,60 @@ jobs:
           MIN_SUCCESS_RATIO: '1'
         run: |
           node src/index.js --batch ${{ matrix.batch }}/${{ env.BATCH_TOTAL }}
+
+  # ==========================================================================
+  # Fold the batch tabs into one sheet and delete them
+  # ==========================================================================
+  # The Batch_NN tabs exist only so parallel jobs cannot clear each other's rows.
+  # Once every job is done they are just clutter — 50 places to look, and one more
+  # for every increase to BATCH_TOTAL — so this job merges them into a single tab
+  # and removes them. The spreadsheet is back to one sheet at the end of each run.
+  consolidate:
+    # MUST wait for every batch: deleting a tab a job is still writing loses its
+    # rows. `always()` so batches that failed or were skipped don't cancel it —
+    # the ones that did succeed still have data worth folding in.
+    needs: sync
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: consolidate
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Merge batch tabs into one sheet
+        env:
+          # No upstream call in this mode — Sheets credentials are all it needs.
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME || 'Sheet1' }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          MASTER_SHEET_NAME: ${{ env.MASTER_SHEET_NAME }}
+          BATCH_SHEET_PREFIX: 'Batch_'
+
+          # 1 = remove each Batch_NN tab once its rows are in the master tab.
+          # Only ever runs after that write succeeds, and only on tabs named
+          # "<prefix><digits>" — a tab you made by hand is never touched.
+          DELETE_BATCH_TABS: '1'
+
+          # The master write MERGES (the mode forces this regardless of
+          # FULL_REFRESH): with the batch tabs deleted, a wallet whose batch was
+          # held back by MIN_SUCCESS_RATIO exists only here. The same
+          # HISTORY_DAYS window that batches fetch is what prunes it, so the tab
+          # cannot grow forever.
+          HISTORY_DAYS: '180'
+
+          CHUNK_SIZE: '500'
+          SHEETS_WRITE_DELAY_MS: '1500'
+          LOG_LEVEL: 'INFO'
+        run: |
+          node src/index.js --consolidate

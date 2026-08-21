@@ -14,6 +14,7 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ✅ **Time-Windowed History** — Last 180 days by `time_at`, paginated newest-first  
 ✅ **Fair Rotation** — Starting wallet rotates so a block can't starve the same wallets  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
+✅ **One Sheet At The End** — A final job merges the batch tabs into one and deletes them  
 ✅ **Rate Limit Aware** — Adaptive throttling + exponential backoff  
 ✅ **429 Handling** — Respects rate limits, retries intelligently  
 ✅ **Timeout Recovery** — Auto-retry on network timeouts  
@@ -59,10 +60,16 @@ GOOGLE_CREDENTIALS={"type":"service_account","project_id":"...","private_key":".
 
 Create a spreadsheet and share it with the service account email as **Editor**.
 
-> 💡 **Batch tabs are created for you.** When using `--batch` (see
+> 💡 **Tabs are created for you.** When using `--batch` (see
 > [Scaling to 200+ Wallets](#-scaling-to-200-wallets-batches--matrix)), tabs like
-> `Batch_01`…`Batch_10` are created automatically with the correct header row —
-> you only need the spreadsheet itself.
+> `Batch_01`…`Batch_50` are created automatically with the correct header row, and
+> so is the `MASTER_SHEET_NAME` tab they are consolidated into. You only need the
+> spreadsheet itself.
+>
+> The batch tabs are also **deleted** at the end of each run, once their rows are
+> in the master tab — so the spreadsheet does not sprout a new sheet every time
+> you raise `BATCH_TOTAL`. Old `Batch_NN` tabs left over from before this existed
+> are picked up and cleared away by the first consolidating run.
 
 For a single-tab setup, create the tab with headers in row 1:
 
@@ -107,6 +114,8 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `BATCH_INDEX` / `BATCH_TOTAL` — Batch slice to process (same as `--batch N/TOTAL`)
 - `TARGET_SHEET_NAME` — Force a target tab (same as `--sheet`)
 - `BATCH_SHEET_PREFIX` — Prefix for batch tabs (default: `Batch_`)
+- `MASTER_SHEET_NAME` — Tab `--consolidate` merges every batch tab into (default: `GOOGLE_SHEET_NAME`)
+- `DELETE_BATCH_TABS` — `0` keeps the `Batch_NN` tabs after consolidating (default: `1`, delete them)
 - `HISTORY_DAYS` — Look-back window in days, by `time_at` (default: `180`; `0` = by row count only)
 - `ROTATION_PERIOD_MS` — Rotate the starting wallet each run (default: `3600000`; `0` disables)
 - `PAGE_COUNT` — Safety ceiling on rows per wallet (default: `2000`)
@@ -185,6 +194,12 @@ Stopping early is safe: with `MIN_SUCCESS_RATIO=1` a partial batch does not
 rewrite its tab, so the previous contents stay, and the start position rotates
 (`ROTATION_PERIOD_MS`) so later runs reach different wallets first.
 
+When the last batch is done, fold the tabs into one sheet and clear them away:
+
+```bash
+node src/index.js --consolidate
+```
+
 ### Local Testing
 
 ```bash
@@ -214,11 +229,23 @@ own GitHub Actions matrix job, writing to its **own sheet tab**.
    │          │           │           │          │
    ▼          ▼           ▼           ▼          ▼
 Batch_01   Batch_02    Batch_03    …   Batch_10        (one tab each)
+   │          │           │           │          │
+   └──────────┴─────┬─────┴───────────┴──────────┘
+                    ▼
+            consolidate job          (needs: sync — after every batch)
+                    │
+                    ▼
+             Transactions            (one tab; the Batch_NN tabs are deleted)
 ```
 
 **Why separate tabs?** Each run does a full refresh (`clear` then write). If every
 job targeted the same tab they would clear each other's rows mid-write — a genuine
 race condition. Per-batch tabs remove the shared resource entirely.
+
+**Why they don't stay.** They are scratch space, not the product. A final job
+folds them into one sheet and deletes them, so the spreadsheet ends every run with
+a single tab no matter how large `BATCH_TOTAL` grows — see
+[One sheet at the end](#one-sheet-at-the-end-consolidating-the-batch-tabs).
 
 ### Running a batch
 
@@ -369,6 +396,69 @@ The log tells you which happened:
 ```
 Full refresh of "Batch_01": writing only the 214 row(s) fetched this run
 Sheet NOT updated — only 1/2 wallets succeeded (below MIN_SUCCESS_RATIO 1)
+```
+
+---
+
+### One sheet at the end: consolidating the batch tabs
+
+Fifty tabs is fifty places to look, and the count grows with every increase to
+`BATCH_TOTAL`. So the batch tabs are treated as what they are — scratch space that
+exists only to keep parallel jobs off each other's rows — and a final job folds
+them into one tab and deletes them:
+
+```bash
+node src/index.js --consolidate                 # → MASTER_SHEET_NAME, tabs deleted
+node src/index.js --into Transactions           # explicit target (implies --consolidate)
+node src/index.js --consolidate --keep-batches  # merge, but leave the tabs alone
+```
+
+In the workflow it is a separate job:
+
+```yaml
+consolidate:
+  needs: sync          # MUST wait for every batch job
+  if: ${{ always() }}  # batches that failed must not cancel it
+```
+
+`needs: sync` is not a formality — deleting a tab a batch job is still writing
+would lose that job's rows. `always()` is there so the batches that *did* succeed
+still get folded in when one of them fails.
+
+It fetches nothing: the only credentials it needs are the Google ones.
+
+**Three rules make the delete safe:**
+
+1. **Write first, delete second.** Tabs are removed only after the master write
+   returns rows. If the write is held back, every tab is kept.
+2. **Only tabs it owns.** The name must match `<BATCH_SHEET_PREFIX><digits>`
+   exactly — `Batch_07` yes, `Batch_notes` no. A tab you made by hand is never
+   swept up, and neither is the master.
+3. **All tabs empty → nothing happens.** That usually means the fetch jobs failed;
+   the spreadsheet is left exactly as it is so the failure is visible rather than
+   quietly tidied away.
+
+**The master tab always merges**, even though the batch tabs are written with
+`FULL_REFRESH=1`. It has to: with the tabs deleted, a wallet whose batch held its
+write back (`MIN_SUCCESS_RATIO=1`) exists nowhere else, and only the merge carries
+it forward. `HISTORY_DAYS` still prunes rows that aged out of the window, so the
+tab cannot grow without bound.
+
+**`recorded_at` is preserved, not restamped.** Consolidation moves rows that were
+fetched earlier by another job; stamping them with the merge time would claim a
+freshness they don't have. So freshness is a per-*tab* property while the run is
+in progress, and a per-*row* one in the master.
+
+Duplicates are collapsed on the usual key (`wallet_address` + digest of `raw` +
+`transfer_idx`). Normally there are none — a wallet belongs to exactly one batch —
+but changing `BATCH_TOTAL` re-slices the list, and a wallet that moved leaves rows
+behind in its old tab. Same key, two copies: the newer `recorded_at` wins.
+
+```
+Consolidating 50 batch tab(s) → Transactions (Batch_01 … Batch_50)
+Collected 12,480 unique row(s) from 50 tab(s), 3 tab(s) empty
+Merged with "Transactions": 12480 fetched, 214 kept from previous runs
+Deleted 50 batch tab(s) — their rows are now in "Transactions"
 ```
 
 ---
@@ -597,7 +687,11 @@ explicitly if needed:
 
 ```bash
 node src/index.js 0x1234... --sheet Batch_03
+node src/index.js 0x1234... --sheet Transactions   # straight into the master tab
 ```
+
+If consolidation has already removed that batch tab, it is recreated for the
+retry and folded back in by the next `--consolidate` — nothing is lost either way.
 
 ### About 429 / 403 — "can I make it look like a real browser, or use another endpoint?"
 

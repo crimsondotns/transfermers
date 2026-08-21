@@ -29,9 +29,13 @@ const num = (envVar, fallback) => parseInt(process.env[envVar] || String(fallbac
 //   node src/index.js --batch 3/10           batch 3 of 10 -> tab "Batch_03"
 //   node src/index.js --sheet Batch_03       explicit target tab
 //   node src/index.js 0xabc...               manual retry for one wallet
+//   node src/index.js --consolidate          fold every Batch_NN tab into one
 //   node src/index.js --help
 function parseArgs(argv) {
-  const out = { wallet: null, sheet: null, batchIndex: null, batchTotal: null, help: false };
+  const out = {
+    wallet: null, sheet: null, batchIndex: null, batchTotal: null, help: false,
+    consolidate: false, into: null, keepBatches: false,
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -46,6 +50,14 @@ function parseArgs(argv) {
       out.sheet = takeValue();
     } else if (arg === '--wallet' || arg.startsWith('--wallet=')) {
       out.wallet = takeValue();
+    } else if (arg === '--consolidate') {
+      out.consolidate = true;
+    } else if (arg === '--into' || arg.startsWith('--into=')) {
+      // Target tab for --consolidate; implies it, so `--into X` alone works.
+      out.into = takeValue();
+      out.consolidate = true;
+    } else if (arg === '--keep-batches') {
+      out.keepBatches = true;
     } else if (arg === '--batch' || arg.startsWith('--batch=')) {
       // Accepts "3/10" (index/total) or a bare "3" (total comes from BATCH_TOTAL).
       const raw = String(takeValue() || '');
@@ -72,6 +84,8 @@ Transaction sync — fetches wallet history and writes it to Google Sheets.
 Usage:
   node src/index.js [options]
   node src/index.js <0xWalletAddress>          Manual retry for one wallet (append only)
+  node src/index.js --consolidate              Fold every Batch_NN tab into one and
+                                               delete them (run after the batches)
 
 Options:
   --batch N/TOTAL     Process only batch N of TOTAL. The wallet list is split into
@@ -80,6 +94,12 @@ Options:
                       (default prefix "Batch_", e.g. Batch_03).
   --sheet NAME        Target sheet tab. Overrides the batch-derived name.
   --wallet 0x...      Same as passing the address positionally.
+  --consolidate       Merge every "<prefix>NN" tab into ONE tab and delete them,
+                      so the spreadsheet keeps a single sheet instead of growing
+                      a new batch tab for every slice. Fetches nothing.
+  --into NAME         Tab --consolidate merges into (default: MASTER_SHEET_NAME,
+                      else GOOGLE_SHEET_NAME). Implies --consolidate.
+  --keep-batches      Consolidate but leave the Batch_NN tabs in place.
   -h, --help          Show this help.
 
 Key environment variables:
@@ -87,6 +107,8 @@ Key environment variables:
   WALLETS_FILE             Path to a JSON file: ["0x..."] or { "wallets": ["0x..."] }
   GOOGLE_SPREADSHEET_ID    Target spreadsheet
   GOOGLE_SHEET_NAME        Default tab when no batch/--sheet is given (default: Sheet1)
+  MASTER_SHEET_NAME        Tab --consolidate merges into (default: GOOGLE_SHEET_NAME)
+  DELETE_BATCH_TABS        0 = keep the Batch_NN tabs after consolidating (default: 1)
   GOOGLE_CREDENTIALS       Service-account JSON
   TARGET_SHEET_NAME        Same as --sheet (CLI wins)
   BATCH_INDEX/BATCH_TOTAL  Same as --batch (CLI wins)
@@ -210,6 +232,21 @@ function resolveSheetName(batch) {
   return GOOGLE_SHEET_NAME;
 }
 
+/** The single tab --consolidate folds every batch tab into. */
+function resolveMasterSheetName() {
+  return CLI.into || process.env.MASTER_SHEET_NAME || GOOGLE_SHEET_NAME;
+}
+
+/**
+ * Matches the tabs --consolidate owns: the batch prefix followed by digits, and
+ * nothing else. Anchored on purpose — a hand-made "Batch_notes" tab is yours,
+ * not ours, and must never be swept up by the delete.
+ */
+function batchTabPattern() {
+  const prefix = process.env.BATCH_SHEET_PREFIX || 'Batch_';
+  return new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d+$`);
+}
+
 const RATE_LIMIT_CONFIG = {
   // --- Request spacing (adaptive: widens on push-back, decays on success) ---
   // Requests are spaced by a RANDOM value in [JITTER_MIN_MS, JITTER_MAX_MS].
@@ -303,6 +340,13 @@ const RATE_LIMIT_CONFIG = {
   // with MIN_SUCCESS_RATIO=1, or a run that misses a wallet writes a thinner
   // snapshot over a complete one.
   FULL_REFRESH: process.env.FULL_REFRESH === '1',
+
+  // --- Consolidation (--consolidate) ---
+  // Delete each Batch_NN tab once its rows are safely in the master tab. On by
+  // default: the batch tabs are scratch space, and leaving 50 of them behind is
+  // exactly the clutter consolidating is meant to remove. Only ever applied
+  // AFTER the master write succeeds, and only to tabs matching batchTabPattern.
+  DELETE_BATCH_TABS: process.env.DELETE_BATCH_TABS !== '0',
 
   // --- Address-poisoning detection (see flagSuspectRows) ---
   // A transfer worth less than this in USD is dust. Combined with the relayer
@@ -1510,8 +1554,18 @@ async function clearSheetContent(sheets, sheetName) {
  *
  * `sheetName` scopes every operation — clear, write and trim — to one tab, so
  * parallel matrix jobs writing different batches never touch each other's rows.
+ *
+ * Options (both only ever set by --consolidate, see consolidateBatches):
+ *   stamp        false leaves each row's own `recorded_at` alone. Consolidation
+ *                moves rows that were fetched earlier, by another job; stamping
+ *                them with the consolidation time would claim a freshness they
+ *                do not have.
+ *   fullRefresh  overrides FULL_REFRESH. The master tab must always merge: the
+ *                batch tabs are deleted right after, so a wallet whose batch
+ *                came up empty this run survives only in the master.
  */
-async function writeToSheet(rows, sheetName) {
+async function writeToSheet(rows, sheetName, opts = {}) {
+  const { stamp = true, fullRefresh = RATE_LIMIT_CONFIG.FULL_REFRESH } = opts;
   if (rows.length === 0) {
     log('WARN', `Nothing fetched — leaving "${sheetName}" untouched (safe-guard)`);
     return 0;
@@ -1529,7 +1583,7 @@ async function writeToSheet(rows, sheetName) {
   // Stamp recorded_at (column AI / index 34) on every freshly fetched row.
   const recordedAt = getCurrentTimestampTH();
   const fresh = rows.map((row) => {
-    row[34] = recordedAt;
+    if (stamp) row[34] = recordedAt;
     return row;
   });
 
@@ -1578,7 +1632,7 @@ async function writeToSheet(rows, sheetName) {
   // otherwise delete the rows of the ones it missed, which is the data loss that
   // PR #13 fixed. Turning it off puts that risk back, so MIN_SUCCESS_RATIO is
   // what keeps a partial run from replacing a good snapshot with a thin one.
-  if (RATE_LIMIT_CONFIG.FULL_REFRESH) {
+  if (fullRefresh) {
     log('INFO', `Full refresh of "${sheetName}": writing only the ` +
       `${c.bold(fresh.length)} row(s) fetched this run — previous contents are replaced`);
     if (RATE_LIMIT_CONFIG.MIN_SUCCESS_RATIO < 1) {
@@ -1750,6 +1804,175 @@ async function appendToSheet(rows, sheetName) {
 
   log('OK', `Appended ${c.bold(values.length)} rows to "${sheetName}"`);
   return values.length;
+}
+
+// ============================================================================
+// CONSOLIDATION — fold every Batch_NN tab into one sheet, then remove them
+// ============================================================================
+// Batch tabs exist for one reason: parallel matrix jobs must not clear and
+// overwrite each other's rows, and a tab per job is what guarantees that. They
+// are scratch space, not the product — 50 of them is 50 places to look, and the
+// count grows with every increase to BATCH_TOTAL.
+//
+// So once the fetching jobs are done, one final job folds them into a single tab
+// and deletes them. It runs after `needs: sync`, never alongside it: deleting a
+// tab a batch job is still writing would lose that job's rows.
+
+// Ranges per values.batchGet call. One request for all 50 tabs would work, but
+// the response carries the `raw` column of every row in the spreadsheet, so this
+// keeps a single response to a sane size.
+const CONSOLIDATE_RANGES_PER_CALL = 20;
+
+/** Every tab this run may consolidate: "<prefix><digits>", never the master. */
+async function listBatchTabs(sheets, masterName) {
+  const meta = await withRetry(() => sheets.spreadsheets.get({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    fields: 'sheets(properties(sheetId,title))',
+  }), 'List spreadsheet tabs');
+
+  const pattern = batchTabPattern();
+  return (meta.data.sheets || [])
+    .map((s) => s.properties)
+    .filter((p) => pattern.test(p.title) && p.title !== masterName)
+    .sort((a, b) => a.title.localeCompare(b.title));
+}
+
+/** Read the data rows of every batch tab, batched into few API calls. */
+async function readBatchTabs(sheets, tabs) {
+  const out = [];
+
+  for (let i = 0; i < tabs.length; i += CONSOLIDATE_RANGES_PER_CALL) {
+    const slice = tabs.slice(i, i + CONSOLIDATE_RANGES_PER_CALL);
+    const res = await withRetry(() => sheets.spreadsheets.values.batchGet({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      // Quoted so a prefix containing a space or a quote still produces a valid A1 range.
+      ranges: slice.map((t) => `'${t.title.replace(/'/g, "''")}'!${DATA_RANGE}`),
+    }), `Read ${slice.length} batch tab(s)`);
+
+    const valueRanges = res.data.valueRanges || [];
+    slice.forEach((tab, j) => out.push({ tab, rows: valueRanges[j]?.values || [] }));
+
+    if (i + CONSOLIDATE_RANGES_PER_CALL < tabs.length) {
+      await jitterDelay(RATE_LIMIT_CONFIG.SHEETS_WRITE_DELAY_MS,
+        RATE_LIMIT_CONFIG.SHEETS_WRITE_DELAY_MS * 1.5);
+    }
+  }
+
+  return out;
+}
+
+/** Sheets drops trailing empty cells on read; give every row the full width. */
+function padRow(row) {
+  const out = row.slice(0, SHEET_HEADER.length);
+  while (out.length < SHEET_HEADER.length) out.push(null);
+  return out;
+}
+
+/** True for a row that is entirely blank (a leftover grid row, not data). */
+function isBlankRow(row) {
+  return !row.some((cell) => String(cell ?? '') !== '');
+}
+
+/**
+ * Merge every batch tab into one, then delete the tabs.
+ *
+ * Deleting is the whole point of the mode, so it is deliberately the LAST step
+ * and conditional on the master write having succeeded. Nothing is removed until
+ * its rows are somewhere else.
+ */
+async function consolidateBatches() {
+  const startTime = Date.now();
+  const masterName = resolveMasterSheetName();
+
+  if (!GOOGLE_SPREADSHEET_ID) throw new Error('GOOGLE_SPREADSHEET_ID not configured');
+
+  log('INFO', 'Authenticating with Google Sheets...');
+  const auth = await getGoogleAuth();
+  const sheets = google.sheets({ version: 'v4', auth, timeout: 60000 });
+
+  const tabs = await listBatchTabs(sheets, masterName);
+  if (tabs.length === 0) {
+    // Not an error: consolidation already ran, or the batches wrote nothing.
+    log('INFO', `No "${batchTabPattern().source}" tabs to consolidate — ` +
+      `"${masterName}" is already the only sheet holding results`);
+    return { success: true, tabs: 0, rows: 0, written: 0, deleted: 0, masterName };
+  }
+
+  log('INFO', `Consolidating ${c.bold(tabs.length)} batch tab(s) → ${c.cyan(masterName)} ` +
+    c.dim(`(${tabs[0].title} … ${tabs[tabs.length - 1].title})`));
+
+  const read = await readBatchTabs(sheets, tabs);
+
+  // Dedupe across tabs. Wallets belong to exactly one batch, so this normally
+  // finds nothing — but a change to BATCH_TOTAL re-slices the list, and a wallet
+  // that moved leaves rows behind in its old tab. Same key, two copies: keep the
+  // one recorded more recently.
+  const byKey = new Map();
+  let duplicates = 0;
+  let empty = 0;
+
+  for (const { tab, rows } of read) {
+    let kept = 0;
+    for (const raw of rows) {
+      if (isBlankRow(raw)) continue;
+      const row = padRow(raw);
+      const key = keyOf(row);
+      const prev = byKey.get(key);
+      if (prev) {
+        duplicates++;
+        if (parseDateTH(row[34]) <= parseDateTH(prev[34])) continue;
+      }
+      byKey.set(key, row);
+      kept++;
+    }
+    if (kept === 0) empty++;
+    log('DEBUG', `${tab.title}: ${kept} row(s)`);
+  }
+
+  const rows = [...byKey.values()];
+  log('INFO', `Collected ${c.bold(rows.length)} unique row(s) from ${tabs.length} tab(s)` +
+    (duplicates ? `, ${duplicates} duplicate(s) resolved by recorded_at` : '') +
+    (empty ? `, ${empty} tab(s) empty` : ''));
+
+  if (rows.length === 0) {
+    // Every tab was empty. Deleting them would be harmless, but an empty batch
+    // tab usually means the fetch jobs failed — leave the spreadsheet exactly as
+    // it is so the failure is visible rather than tidied away.
+    log('WARN', `Every batch tab is empty — "${masterName}" left untouched and ` +
+      `no tab deleted. Check the fetch jobs before re-running.`);
+    return { success: true, tabs: tabs.length, rows: 0, written: 0, deleted: 0, masterName };
+  }
+
+  // stamp:false keeps each row's own recorded_at — it says when the row was
+  // FETCHED, and consolidation does not refetch anything.
+  // fullRefresh:false is not optional here: the batch tabs are about to be
+  // deleted, so any wallet whose batch was held back this run (MIN_SUCCESS_RATIO)
+  // exists only in the master, and only the merge carries it forward.
+  const written = await writeToSheet(rows, masterName, { stamp: false, fullRefresh: false });
+
+  if (written === 0) {
+    log('WARN', `"${masterName}" was not written — keeping every batch tab`);
+    return { success: true, tabs: tabs.length, rows: rows.length, written: 0, deleted: 0, masterName };
+  }
+
+  let deleted = 0;
+  if (!RATE_LIMIT_CONFIG.DELETE_BATCH_TABS || CLI.keepBatches) {
+    log('INFO', `Keeping ${tabs.length} batch tab(s) (DELETE_BATCH_TABS=0)`);
+  } else {
+    await withRetry(() => sheets.spreadsheets.batchUpdate({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      resource: { requests: tabs.map((t) => ({ deleteSheet: { sheetId: t.sheetId } })) },
+    }), `Delete ${tabs.length} batch tab(s)`);
+    deleted = tabs.length;
+    log('OK', `Deleted ${c.bold(deleted)} batch tab(s) — their rows are now in ` +
+      `"${masterName}"`);
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  log('OK', `${c.bold('Consolidation completed')} in ${elapsed}s — ${written} row(s) ` +
+    `in "${masterName}", ${deleted} tab(s) removed`);
+
+  return { success: true, tabs: tabs.length, rows: rows.length, written, deleted, masterName };
 }
 
 // ============================================================================
@@ -2048,7 +2271,8 @@ let lockFile = null;
 function lockFileFor() {
   let suffix = '';
   try {
-    const name = resolveSheetName(resolveBatch());
+    // Consolidation writes the master tab, so that is what it must lock.
+    const name = CLI.consolidate ? resolveMasterSheetName() : resolveSheetName(resolveBatch());
     suffix = '.' + String(name).replace(/[^A-Za-z0-9_-]/g, '_');
   } catch {
     /* bad batch args are reported later by the real code path */
@@ -2111,7 +2335,9 @@ async function main() {
 
     // A wallet address (positional or --wallet) switches to manual retry mode.
     let result;
-    if (CLI.wallet) {
+    if (CLI.consolidate) {
+      result = await consolidateBatches();
+    } else if (CLI.wallet) {
       if (!/^0x[0-9a-fA-F]{40}$/.test(CLI.wallet)) {
         throw new Error(`Invalid wallet address: "${CLI.wallet}" (expected 0x + 40 hex chars)`);
       }
@@ -2165,6 +2391,13 @@ module.exports = {
   loadAllWallets,
   resolveBatch,
   resolveSheetName,
+  resolveMasterSheetName,
+  batchTabPattern,
+  consolidateBatches,
+  listBatchTabs,
+  readBatchTabs,
+  padRow,
+  isBlankRow,
   SHEET_HEADER,
   LAST_COL,
   DATA_RANGE,
