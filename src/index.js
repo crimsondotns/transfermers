@@ -2435,12 +2435,13 @@ async function main() {
   }
 }
 
-// Only auto-run when executed directly (`node src/index.js`), so the helpers
-// above can be imported and unit-tested without triggering a live sync.
-if (require.main === module) {
-  main();
-}
-
+// The exports MUST be assigned BEFORE the auto-run below.
+//
+// main() is async, but everything up to its first await runs synchronously —
+// and that prefix includes `require('./solana.js')`, which requires this module
+// straight back. With the auto-run first, that re-entry saw module.exports still
+// empty and every --chain sol run died on "makeSchema is not a function". Unit
+// tests could not catch it: they import this file, so main() never runs.
 module.exports = {
   RateLimitManager,
   DeadlineError,
@@ -2509,3 +2510,9 @@ module.exports = {
   maskAddr,
   RATE_LIMIT_CONFIG,
 };
+
+// Only auto-run when executed directly (`node src/index.js`), so the helpers
+// above can be imported and unit-tested without triggering a live sync.
+if (require.main === module) {
+  main();
+}
