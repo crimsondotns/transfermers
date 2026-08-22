@@ -15,6 +15,7 @@ Designed specifically for **GitHub Actions** — no local setup required, runs o
 ✅ **Fair Rotation** — Starting wallet rotates so a block can't starve the same wallets  
 ✅ **No Race Conditions** — Each batch clears and writes only its own sheet tab  
 ✅ **One Sheet At The End** — A final job merges the batch tabs into one and deletes them  
+✅ **Solana Too** — `--chain sol` syncs transfers + swaps from two keyless feeds into their own tab  
 ✅ **Rate Limit Aware** — Adaptive throttling + exponential backoff  
 ✅ **429 Handling** — Respects rate limits, retries intelligently  
 ✅ **Timeout Recovery** — Auto-retry on network timeouts  
@@ -47,6 +48,15 @@ Add these **Repository Secrets** in GitHub Settings → Secrets and variables �
 | `GOOGLE_SPREADSHEET_ID` | Found in sheet URL: `docs.google.com/spreadsheets/d/{ID}/edit` |
 | `GOOGLE_SHEET_NAME` | Sheet tab name (default: `Sheet1`) |
 | `GOOGLE_CREDENTIALS` | Full JSON from service account key |
+
+For the Solana workflow (`--chain sol`), add these as well:
+
+| Secret Name | Value |
+|---|---|
+| `SOL_TRANSFERS_API_URL` | Transfers feed; the address is appended as `<url>/<address>` |
+| `SOL_SWAPS_API_URL` | Swaps feed, same shape |
+| `SOL_WALLET_LIST` | Comma-separated base58 accounts — **case sensitive**, do not lower-case |
+| `SOL_MASTER_SHEET_NAME` | Optional; the tab Solana rows land in (default: `Solana`) |
 
 **Example:**
 ```bash
@@ -105,8 +115,13 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 **Required:**
 - `HISTORY_API_URL` — Upstream history endpoint (kept out of the source on purpose; the run fails fast if it is unset)
 - `WALLET_LIST` — Comma-separated wallet addresses
+
 - `GOOGLE_SPREADSHEET_ID` — Google Sheet ID
 - `GOOGLE_CREDENTIALS` — Service account JSON
+
+**Required for `--chain sol` only:**
+- `SOL_TRANSFERS_API_URL` / `SOL_SWAPS_API_URL` — The two Solana feeds; the address is appended as `<url>/<address>`
+- `SOL_WALLET_LIST` — Comma-separated base58 accounts (**case sensitive**, unlike the hex list above)
 
 **Optional (with sensible defaults):**
 - `GOOGLE_SHEET_NAME` — Sheet tab name (default: `Sheet1`)
@@ -115,6 +130,9 @@ All can be configured in `.env` file for local testing, or via GitHub Secrets fo
 - `TARGET_SHEET_NAME` — Force a target tab (same as `--sheet`)
 - `BATCH_SHEET_PREFIX` — Prefix for batch tabs (default: `Batch_`)
 - `MASTER_SHEET_NAME` — Tab `--consolidate` merges every batch tab into (default: `GOOGLE_SHEET_NAME`)
+- `SOL_WALLETS_FILE` — JSON file of Solana wallets, alternative to `SOL_WALLET_LIST`
+- `SOL_TRANSFERS_CURSOR_PARAM` — Paging parameter for the transfers feed (default: `next`)
+- `SOL_SWAPS_CURSOR_PARAM` — Paging parameter for the swaps feed (default: `offset` — a guess, see [Solana](#-solana))
 - `DELETE_BATCH_TABS` — `0` keeps the `Batch_NN` tabs after consolidating (default: `1`, delete them)
 - `HISTORY_DAYS` — Look-back window in days, by `time_at` (default: `180`; `0` = by row count only)
 - `ROTATION_PERIOD_MS` — Rotate the starting wallet each run (default: `3600000`; `0` disables)
@@ -714,6 +732,99 @@ spirit of the API's limits. Two honest options actually fix it:
 > ⚠️ Spoofing browser fingerprints, rotating proxies, or driving a headless browser to
 > evade the block are **not** supported here by design — they break easily and abuse the
 > service. Politeness + the official API are the durable answers.
+
+---
+
+## ◎ Solana
+
+A second, independent sync — `--chain sol` — with its own feeds, wallet list, tab
+and columns:
+
+```bash
+node src/index.js --chain sol                     # every Solana wallet → one tab
+node src/index.js --chain sol --batch 3/10        # slice 3 → tab "SolBatch_03"
+node src/index.js --chain sol --consolidate       # fold those tabs into "Solana"
+```
+
+Two public GET endpoints, address appended as `<url>/<address>`, configured as
+`SOL_TRANSFERS_API_URL` and `SOL_SWAPS_API_URL`. **No API key, no bearer token** —
+which is the whole reason this shape was chosen. A wallet-extension endpoint was
+evaluated first and rejected: its token was valid for exactly 3601 seconds while
+the workflow runs every 6 hours, so every scheduled run would have started with a
+token that died hours earlier.
+
+The two feeds do not overlap — 0 of 50 swaps shared a `txHash` with any of the 30
+transfers on a real wallet — so both are fetched whole and neither is filtered
+against the other.
+
+### Why it does not reuse the 39 EVM columns
+
+There is no gas price in ETH, no `approve`, no `project_id`, and a mint address
+is not an ERC-20 contract. Forcing Solana into that header would leave a third of
+it blank and mislabel most of the rest. It gets **24 columns (A–X)** instead:
+
+```
+kind | chain | tx_hash | block_id | block_time | direction | counterparty |
+from_address | to_address | send_amount | send_asset | recv_amount | recv_asset |
+amount_raw | usd_volume | fee_amount | fee_payer | is_gasless | is_inner_ix |
+platform | recorded_at | raw | suspect | wallet_address
+```
+
+A transfer and a swap share the tab because they answer the same question — what
+moved, and which way. A swap is simply a row with both sides filled, exactly as an
+EVM swap fills `send_*` and `recv_*` on one row. `direction` (`in`/`out`/`self`/
+`swap`) is **derived**: the feed returns the transfer, not your view of it.
+
+Everything *below* the mapping is shared with the EVM side — the merge that cannot
+lose a row, the batch tabs, their consolidation, the grid growing and trimming,
+`FULL_REFRESH`, `MIN_SUCCESS_RATIO`, the poisoning flags. Those took three PRs to
+get right and are not worth re-deriving per chain.
+
+### `wallet_address` is mandatory here too, for a new reason
+
+Of 50 real swaps, **7 had `feePayerPublicKey: null`** — every one of them
+`isGasless: true`. In those objects the tracked wallet appears *nowhere*; a string
+search of the raw JSON does not find it. Two tracked wallets trading the same pool
+would produce byte-identical rows, and one would overwrite the other. So the wallet
+is recorded as a column and is part of the merge key, exactly as on the EVM side.
+
+> **base58 is case sensitive.** `GZ3t…` and `gz3t…` are different accounts and only
+> one exists. `SOL_WALLET_LIST` is therefore *not* lower-cased the way `WALLET_LIST`
+> is, and the Solana merge key compares the address verbatim.
+
+### Paging, and the one thing that is still a guess
+
+| Feed | Says there is more | Cursor | Page 1 covered |
+|---|---|---|---|
+| transfers | `next` (unix timestamp) | that value | 73 days / 30 rows |
+| swaps | `hasMoreData: true` | **none at all** | 37 days / 50 rows |
+
+A 180-day window therefore needs several pages of each. The transfers cursor is
+unambiguous. The swaps feed announces more data without saying how to ask for it,
+so `SOL_SWAPS_CURSOR_PARAM` defaults to `offset` — **a guess**.
+
+Being wrong is safe: if the server ignores the parameter, page 2 comes back
+identical to page 1, which the run detects on the first row and stops, logging
+exactly which variable to correct. It costs one extra request, never a loop.
+
+```
+swaps: page 2 repeats page 1 — the "offset" parameter was ignored by the server.
+Stopping at 50 row(s). Find the real parameter in the browser's network tab and
+set SOL_SWAPS_CURSOR_PARAM.
+```
+
+### Sizing
+
+Nothing like the EVM side's ~10-requests-per-IP wall has been observed here, and
+there is no pending-job polling to waste requests on, so the split is much
+coarser: **10 jobs** for ~100 wallets rather than 50, with a 150-request per-job
+budget that is an anti-runaway guard rather than a quota. `SolBatch_NN` tabs
+consolidate into `Solana` and are deleted, same as the EVM side — and because the
+prefix pattern is anchored, neither workflow's consolidation can ever see or
+delete the other's tabs.
+
+The Solana workflow runs on its own schedule (`:30` past, offset from the EVM one)
+so the two never contend for the Google Sheets write quota.
 
 ---
 

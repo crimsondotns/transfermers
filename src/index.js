@@ -34,7 +34,7 @@ const num = (envVar, fallback) => parseInt(process.env[envVar] || String(fallbac
 function parseArgs(argv) {
   const out = {
     wallet: null, sheet: null, batchIndex: null, batchTotal: null, help: false,
-    consolidate: false, into: null, keepBatches: false,
+    consolidate: false, into: null, keepBatches: false, chain: null,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -50,6 +50,12 @@ function parseArgs(argv) {
       out.sheet = takeValue();
     } else if (arg === '--wallet' || arg.startsWith('--wallet=')) {
       out.wallet = takeValue();
+    } else if (arg === '--chain' || arg.startsWith('--chain=')) {
+      const value = String(takeValue()).toLowerCase();
+      if (!['evm', 'sol', 'solana'].includes(value)) {
+        throw new Error(`Unknown --chain "${value}" (expected evm or sol)`);
+      }
+      out.chain = value === 'solana' ? 'sol' : value;
     } else if (arg === '--consolidate') {
       out.consolidate = true;
     } else if (arg === '--into' || arg.startsWith('--into=')) {
@@ -86,12 +92,18 @@ Usage:
   node src/index.js <0xWalletAddress>          Manual retry for one wallet (append only)
   node src/index.js --consolidate              Fold every Batch_NN tab into one and
                                                delete them (run after the batches)
+  node src/index.js --chain sol                Solana sync (its own feeds, tab and
+                                               columns; combine with the flags above)
 
 Options:
   --batch N/TOTAL     Process only batch N of TOTAL. The wallet list is split into
                       TOTAL contiguous slices; this run handles slice N (1-based).
                       Unless --sheet is given, the target tab becomes "<prefix>NN"
                       (default prefix "Batch_", e.g. Batch_03).
+  --chain evm|sol     Which chain to sync. Default evm. "sol" reads the two
+                      Solana feeds instead, and writes its own column set to its
+                      own tab — the EVM columns do not fit it. Works with
+                      --batch, --sheet and --consolidate exactly the same way.
   --sheet NAME        Target sheet tab. Overrides the batch-derived name.
   --wallet 0x...      Same as passing the address positionally.
   --consolidate       Merge every "<prefix>NN" tab into ONE tab and delete them,
@@ -103,7 +115,10 @@ Options:
   -h, --help          Show this help.
 
 Key environment variables:
-  WALLET_LIST              Comma-separated wallet addresses (or use WALLETS_FILE)
+  WALLET_LIST              Comma-separated wallet addresses
+  SOL_WALLET_LIST          Same, for --chain sol (base58, case IS significant)
+  SOL_TRANSFERS_API_URL    Solana transfers feed (address is appended to it)
+  SOL_SWAPS_API_URL        Solana swaps feed (address is appended to it) (or use WALLETS_FILE)
   WALLETS_FILE             Path to a JSON file: ["0x..."] or { "wallets": ["0x..."] }
   GOOGLE_SPREADSHEET_ID    Target spreadsheet
   GOOGLE_SHEET_NAME        Default tab when no batch/--sheet is given (default: Sheet1)
@@ -138,14 +153,23 @@ safety-timeout settings.
 // the same BATCH_INDEX always maps to the same wallets.
 
 /** Read every configured wallet, from WALLET_LIST or WALLETS_FILE. */
-function loadAllWallets() {
+function loadAllWallets(opts = {}) {
+  const {
+    envVar = 'WALLET_LIST',
+    fileVar = 'WALLETS_FILE',
+    // EVM addresses are case-insensitive hex, so lower-casing them de-duplicates
+    // the same wallet written two ways. Solana addresses are base58 and CASE
+    // SENSITIVE — lower-casing one produces a different, non-existent account —
+    // so the Solana loader turns this off.
+    lowercase = true,
+  } = opts;
   const raw = [];
 
-  if (process.env.WALLET_LIST) {
-    raw.push(...process.env.WALLET_LIST.split(','));
-  } else if (process.env.WALLETS_FILE) {
-    const file = path.resolve(process.env.WALLETS_FILE);
-    if (!fs.existsSync(file)) throw new Error(`WALLETS_FILE not found: ${file}`);
+  if (process.env[envVar]) {
+    raw.push(...process.env[envVar].split(','));
+  } else if (process.env[fileVar]) {
+    const file = path.resolve(process.env[fileVar]);
+    if (!fs.existsSync(file)) throw new Error(`${fileVar} not found: ${file}`);
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     const list = Array.isArray(parsed) ? parsed : parsed.wallets;
     if (!Array.isArray(list)) {
@@ -158,7 +182,8 @@ function loadAllWallets() {
   const seen = new Set();
   const wallets = [];
   for (const entry of raw) {
-    const addr = String(entry).trim().toLowerCase();
+    const trimmed = String(entry).trim();
+    const addr = lowercase ? trimmed.toLowerCase() : trimmed;
     if (addr && !seen.has(addr)) {
       seen.add(addr);
       wallets.push(addr);
@@ -1241,10 +1266,8 @@ const SHEET_HEADER = [
   'transfer_idx', 'raw', 'suspect', 'wallet_address',
 ];
 
-// Last column letter of the header, used in every A1 range below so the ranges
-// cannot drift out of sync with SHEET_HEADER when a column is added.
-const LAST_COL = (() => {
-  let n = SHEET_HEADER.length; // 1-based
+/** 1-based column number to its A1 letter: 1 -> A, 27 -> AA, 39 -> AM. */
+function colLetter(n) {
   let s = '';
   while (n > 0) {
     const rem = (n - 1) % 26;
@@ -1252,8 +1275,53 @@ const LAST_COL = (() => {
     n = Math.floor((n - 1) / 26);
   }
   return s;
-})();
+}
+
+// Last column letter of the header, used in every A1 range below so the ranges
+// cannot drift out of sync with SHEET_HEADER when a column is added.
+const LAST_COL = colLetter(SHEET_HEADER.length);
 const DATA_RANGE = `A2:${LAST_COL}`;
+
+/**
+ * A sheet schema: everything the Sheets layer needs to handle a set of columns
+ * without knowing what they mean.
+ *
+ * Solana rows do not fit the EVM columns (no gas in ETH, a swap has no
+ * counterparty, a mint is not an ERC-20 address), so they get their own tab and
+ * their own header — but the parts worth trusting are the ones that took three
+ * PRs to get right: the merge that never loses a row, the grid growing and
+ * trimming, the batch tabs and their consolidation. Those are schema-agnostic,
+ * so the schema is passed in rather than hard-coded and both chains share them.
+ *
+ *   timeIdx     column sorted on, and compared against the HISTORY_DAYS window
+ *   stampIdx    recorded_at
+ *   keyOf       merge identity of a row (see the EVM keyOf for why it is a hash)
+ *   olderKeyOf  key a row written by an EARLIER version would carry, or null
+ *               when the row is already current — drives one-time migrations
+ */
+function makeSchema({ name, header, timeIdx, stampIdx, keyOf, olderKeyOf = () => null }) {
+  const lastCol = colLetter(header.length);
+  return {
+    name, header, timeIdx, stampIdx, keyOf, olderKeyOf,
+    lastCol,
+    dataRange: `A2:${lastCol}`,
+    width: header.length,
+  };
+}
+
+/** The 39-column EVM schema this project started as, and every default. */
+const EVM_SCHEMA = makeSchema({
+  name: 'evm',
+  header: SHEET_HEADER,
+  timeIdx: 16,   // time_at
+  stampIdx: 34,  // recorded_at
+  keyOf: (row) => keyOf(row),
+  olderKeyOf: (row) => {
+    if (!hasRaw(row)) return legacyKeyOf(row);
+    if (!hasWallet(row)) return walletlessKeyOf(row);
+    return null; // current scheme — matched by keyOf directly
+  },
+});
 
 /** True when a row carries the `raw` column. */
 function hasRaw(row) {
@@ -1441,11 +1509,11 @@ async function findSheetProps(sheets, sheetName) {
  * matrix jobs may reach this at the same time — a concurrent creation that loses
  * the race surfaces as "already exists", which we resolve by re-reading.
  */
-async function ensureSheetTab(sheets, sheetName) {
+async function ensureSheetTab(sheets, sheetName, schema = EVM_SCHEMA) {
   const existing = await withRetry(
     () => findSheetProps(sheets, sheetName), `Look up tab "${sheetName}"`);
 
-  if (existing) return widenSheetTab(sheets, existing, sheetName);
+  if (existing) return widenSheetTab(sheets, existing, sheetName, schema);
 
   log('INFO', `Tab "${sheetName}" not found — creating it`);
   try {
@@ -1456,7 +1524,7 @@ async function ensureSheetTab(sheets, sheetName) {
           addSheet: {
             properties: {
               title: sheetName,
-              gridProperties: { rowCount: 1000, columnCount: SHEET_HEADER.length },
+              gridProperties: { rowCount: 1000, columnCount: schema.width },
             },
           },
         }],
@@ -1467,7 +1535,7 @@ async function ensureSheetTab(sheets, sheetName) {
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
       range: `${sheetName}!A1`,
       valueInputOption: 'RAW',
-      resource: { values: [SHEET_HEADER] },
+      resource: { values: [schema.header] },
     });
     log('OK', `Created tab "${sheetName}" with header row`);
   } catch (err) {
@@ -1479,7 +1547,7 @@ async function ensureSheetTab(sheets, sheetName) {
   const props = await withRetry(
     () => findSheetProps(sheets, sheetName), `Re-read tab "${sheetName}"`);
   if (!props) throw new Error(`Sheet tab "${sheetName}" could not be created or found`);
-  return widenSheetTab(sheets, props, sheetName);
+  return widenSheetTab(sheets, props, sheetName, schema);
 }
 
 /**
@@ -1491,12 +1559,12 @@ async function ensureSheetTab(sheets, sheetName) {
  * grid does not have — so this has to happen in code. No spreadsheet edit is
  * needed to pick up new columns.
  */
-async function widenSheetTab(sheets, props, sheetName) {
+async function widenSheetTab(sheets, props, sheetName, schema = EVM_SCHEMA) {
   const width = props.gridProperties?.columnCount || 0;
-  if (width >= SHEET_HEADER.length) return props;
+  if (width >= schema.width) return props;
 
   log('INFO', `Tab "${sheetName}" is ${width} columns wide but the header needs ` +
-    `${SHEET_HEADER.length} — widening it`);
+    `${schema.width} — widening it`);
 
   await withRetry(() => sheets.spreadsheets.batchUpdate({
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
@@ -1505,7 +1573,7 @@ async function widenSheetTab(sheets, props, sheetName) {
         updateSheetProperties: {
           properties: {
             sheetId: props.sheetId,
-            gridProperties: { columnCount: SHEET_HEADER.length },
+            gridProperties: { columnCount: schema.width },
           },
           fields: 'gridProperties.columnCount',
         },
@@ -1517,15 +1585,15 @@ async function widenSheetTab(sheets, props, sheetName) {
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
     range: `${sheetName}!A1`,
     valueInputOption: 'RAW',
-    resource: { values: [SHEET_HEADER] },
+    resource: { values: [schema.header] },
   }), `Rewrite header of "${sheetName}"`);
 
-  log('OK', `Widened "${sheetName}" ${width} → ${SHEET_HEADER.length} columns ` +
-    `(A–${LAST_COL}) and refreshed the header row`);
+  log('OK', `Widened "${sheetName}" ${width} → ${schema.width} columns ` +
+    `(A–${schema.lastCol}) and refreshed the header row`);
 
   return {
     ...props,
-    gridProperties: { ...props.gridProperties, columnCount: SHEET_HEADER.length },
+    gridProperties: { ...props.gridProperties, columnCount: schema.width },
   };
 }
 
@@ -1535,12 +1603,12 @@ async function widenSheetTab(sheets, props, sheetName) {
  * Always call this immediately before writing a new set, and only after any
  * existing rows that must be preserved have already been read.
  */
-async function clearSheetContent(sheets, sheetName) {
+async function clearSheetContent(sheets, sheetName, schema = EVM_SCHEMA) {
   await withRetry(() => sheets.spreadsheets.values.clear({
     spreadsheetId: GOOGLE_SPREADSHEET_ID,
-    range: `${sheetName}!${DATA_RANGE}`,
+    range: `${sheetName}!${schema.dataRange}`,
   }), `Clear content of "${sheetName}"`);
-  log('OK', `ClearContent: wiped "${sheetName}" ${DATA_RANGE} before writing`);
+  log('OK', `ClearContent: wiped "${sheetName}" ${schema.dataRange} before writing`);
 }
 
 /**
@@ -1565,7 +1633,11 @@ async function clearSheetContent(sheets, sheetName) {
  *                came up empty this run survives only in the master.
  */
 async function writeToSheet(rows, sheetName, opts = {}) {
-  const { stamp = true, fullRefresh = RATE_LIMIT_CONFIG.FULL_REFRESH } = opts;
+  const {
+    stamp = true,
+    fullRefresh = RATE_LIMIT_CONFIG.FULL_REFRESH,
+    schema = EVM_SCHEMA,
+  } = opts;
   if (rows.length === 0) {
     log('WARN', `Nothing fetched — leaving "${sheetName}" untouched (safe-guard)`);
     return 0;
@@ -1576,14 +1648,14 @@ async function writeToSheet(rows, sheetName, opts = {}) {
   const sheets = google.sheets({ version: 'v4', auth, timeout: 60000 });
 
   // Creates the tab on first use so each batch owns its own target.
-  const props = await ensureSheetTab(sheets, sheetName);
+  const props = await ensureSheetTab(sheets, sheetName, schema);
   const sheetId = props.sheetId;
   const currentRowCount = props.gridProperties?.rowCount || 1000;
 
-  // Stamp recorded_at (column AI / index 34) on every freshly fetched row.
+  // Stamp recorded_at on every freshly fetched row.
   const recordedAt = getCurrentTimestampTH();
   const fresh = rows.map((row) => {
-    if (stamp) row[34] = recordedAt;
+    if (stamp) row[schema.stampIdx] = recordedAt;
     return row;
   });
 
@@ -1597,7 +1669,7 @@ async function writeToSheet(rows, sheetName, opts = {}) {
   // then on a hand-picked set of direction fields (which still could not separate
   // two identical-amount transfers) — so the key now comes from the API's own
   // bytes plus the two things those bytes cannot express.
-  const merged = new Map(fresh.map((row) => [keyOf(row), row]));
+  const merged = new Map(fresh.map((row) => [schema.keyOf(row), row]));
   let carried = 0;
   let expired = 0;
   let superseded = 0;
@@ -1608,16 +1680,12 @@ async function writeToSheet(rows, sheetName, opts = {}) {
   // had under each earlier scheme; an older row whose key is claimed has been
   // re-fetched and is dropped, and the rest are carried over untouched.
   const claimedOlder = new Set();
-  for (const row of fresh) {
-    claimedOlder.add(legacyKeyOf(row));    // before `raw` existed
-    claimedOlder.add(walletlessKeyOf(row)); // before `wallet_address` existed
+  if (schema === EVM_SCHEMA) {
+    for (const row of fresh) {
+      claimedOlder.add(legacyKeyOf(row));     // before `raw` existed
+      claimedOlder.add(walletlessKeyOf(row)); // before `wallet_address` existed
+    }
   }
-  /** The key an existing row is stored under, if it predates the current scheme. */
-  const olderKeyOf = (row) => {
-    if (!hasRaw(row)) return legacyKeyOf(row);
-    if (!hasWallet(row)) return walletlessKeyOf(row);
-    return null; // current scheme — matched by keyOf directly
-  };
 
   const cutoffMs = RATE_LIMIT_CONFIG.HISTORY_DAYS > 0
     ? Date.now() - RATE_LIMIT_CONFIG.HISTORY_DAYS * 86400000
@@ -1644,18 +1712,18 @@ async function writeToSheet(rows, sheetName, opts = {}) {
   } else {
     const existing = await withRetry(() => sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: `${sheetName}!${DATA_RANGE}`,
+      range: `${sheetName}!${schema.dataRange}`,
     }), `Read existing rows from "${sheetName}"`);
 
     for (const row of existing.data.values || []) {
-      const key = keyOf(row);
+      const key = schema.keyOf(row);
       if (merged.has(key)) continue;                       // refreshed this run
-      const older = olderKeyOf(row);
+      const older = schema.olderKeyOf(row);
       if (older !== null && claimedOlder.has(older)) {
         superseded++;                                      // older-format row, re-fetched
         continue;
       }
-      if (cutoffMs && parseDateTH(row[16]) < cutoffMs) {    // outside the window now
+      if (cutoffMs && parseDateTH(row[schema.timeIdx]) < cutoffMs) { // outside the window now
         expired++;
         continue;
       }
@@ -1672,7 +1740,7 @@ async function writeToSheet(rows, sheetName, opts = {}) {
   }
 
   const values = [...merged.values()]
-    .sort((a, b) => parseDateTH(b[16]) - parseDateTH(a[16]));
+    .sort((a, b) => parseDateTH(b[schema.timeIdx]) - parseDateTH(a[schema.timeIdx]));
 
   if (values.length === 0) {
     log('WARN', `Nothing to write to "${sheetName}" after merge — leaving it untouched`);
@@ -1700,7 +1768,7 @@ async function writeToSheet(rows, sheetName, opts = {}) {
   // 2) Wipe every existing data row before writing the new set. This runs AFTER
   //    the merge read above, so nothing that needs preserving is lost, and it
   //    guarantees no stale row can survive below the rows we are about to write.
-  await clearSheetContent(sheets, sheetName);
+  await clearSheetContent(sheets, sheetName, schema);
 
   // 3) Overwrite in place, chunked (values.update — never inserts rows).
   const totalChunks = Math.ceil(values.length / RATE_LIMIT_CONFIG.CHUNK_SIZE);
@@ -1838,7 +1906,7 @@ async function listBatchTabs(sheets, masterName) {
 }
 
 /** Read the data rows of every batch tab, batched into few API calls. */
-async function readBatchTabs(sheets, tabs) {
+async function readBatchTabs(sheets, tabs, schema = EVM_SCHEMA) {
   const out = [];
 
   for (let i = 0; i < tabs.length; i += CONSOLIDATE_RANGES_PER_CALL) {
@@ -1846,7 +1914,7 @@ async function readBatchTabs(sheets, tabs) {
     const res = await withRetry(() => sheets.spreadsheets.values.batchGet({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
       // Quoted so a prefix containing a space or a quote still produces a valid A1 range.
-      ranges: slice.map((t) => `'${t.title.replace(/'/g, "''")}'!${DATA_RANGE}`),
+      ranges: slice.map((t) => `'${t.title.replace(/'/g, "''")}'!${schema.dataRange}`),
     }), `Read ${slice.length} batch tab(s)`);
 
     const valueRanges = res.data.valueRanges || [];
@@ -1862,9 +1930,9 @@ async function readBatchTabs(sheets, tabs) {
 }
 
 /** Sheets drops trailing empty cells on read; give every row the full width. */
-function padRow(row) {
-  const out = row.slice(0, SHEET_HEADER.length);
-  while (out.length < SHEET_HEADER.length) out.push(null);
+function padRow(row, schema = EVM_SCHEMA) {
+  const out = row.slice(0, schema.width);
+  while (out.length < schema.width) out.push(null);
   return out;
 }
 
@@ -1880,7 +1948,7 @@ function isBlankRow(row) {
  * and conditional on the master write having succeeded. Nothing is removed until
  * its rows are somewhere else.
  */
-async function consolidateBatches() {
+async function consolidateBatches(schema = EVM_SCHEMA) {
   const startTime = Date.now();
   const masterName = resolveMasterSheetName();
 
@@ -1901,7 +1969,7 @@ async function consolidateBatches() {
   log('INFO', `Consolidating ${c.bold(tabs.length)} batch tab(s) → ${c.cyan(masterName)} ` +
     c.dim(`(${tabs[0].title} … ${tabs[tabs.length - 1].title})`));
 
-  const read = await readBatchTabs(sheets, tabs);
+  const read = await readBatchTabs(sheets, tabs, schema);
 
   // Dedupe across tabs. Wallets belong to exactly one batch, so this normally
   // finds nothing — but a change to BATCH_TOTAL re-slices the list, and a wallet
@@ -1915,12 +1983,12 @@ async function consolidateBatches() {
     let kept = 0;
     for (const raw of rows) {
       if (isBlankRow(raw)) continue;
-      const row = padRow(raw);
-      const key = keyOf(row);
+      const row = padRow(raw, schema);
+      const key = schema.keyOf(row);
       const prev = byKey.get(key);
       if (prev) {
         duplicates++;
-        if (parseDateTH(row[34]) <= parseDateTH(prev[34])) continue;
+        if (parseDateTH(row[schema.stampIdx]) <= parseDateTH(prev[schema.stampIdx])) continue;
       }
       byKey.set(key, row);
       kept++;
@@ -1948,7 +2016,8 @@ async function consolidateBatches() {
   // fullRefresh:false is not optional here: the batch tabs are about to be
   // deleted, so any wallet whose batch was held back this run (MIN_SUCCESS_RATIO)
   // exists only in the master, and only the merge carries it forward.
-  const written = await writeToSheet(rows, masterName, { stamp: false, fullRefresh: false });
+  const written = await writeToSheet(rows, masterName,
+    { stamp: false, fullRefresh: false, schema });
 
   if (written === 0) {
     log('WARN', `"${masterName}" was not written — keeping every batch tab`);
@@ -2334,9 +2403,15 @@ async function main() {
     acquireLock();
 
     // A wallet address (positional or --wallet) switches to manual retry mode.
+    // Required lazily: src/solana.js requires this module back, and at call
+    // time these exports are fully populated.
+    const sol = CLI.chain === 'sol' ? require('./solana.js') : null;
+
     let result;
     if (CLI.consolidate) {
-      result = await consolidateBatches();
+      result = sol ? await sol.consolidateSolana() : await consolidateBatches();
+    } else if (sol) {
+      result = await sol.processSolana();
     } else if (CLI.wallet) {
       if (!/^0x[0-9a-fA-F]{40}$/.test(CLI.wallet)) {
         throw new Error(`Invalid wallet address: "${CLI.wallet}" (expected 0x + 40 hex chars)`);
@@ -2392,6 +2467,22 @@ module.exports = {
   resolveBatch,
   resolveSheetName,
   resolveMasterSheetName,
+  // --- shared with src/solana.js (required lazily there to avoid a cycle) ---
+  log,
+  c,
+  sleep,
+  jitterDelay,
+  withRetry,
+  getGoogleAuth,
+  colLetter,
+  makeSchema,
+  EVM_SCHEMA,
+  rawCell,
+  getCurrentTimestampTH,
+  formatDateTH,
+  API_HEADERS,
+  HTTPS_AGENT,
+  CLI,
   batchTabPattern,
   consolidateBatches,
   listBatchTabs,

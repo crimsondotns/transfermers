@@ -1,0 +1,169 @@
+name: Solana Sync
+
+on:
+  schedule:
+    # Offset by 30 minutes from the EVM workflow so the two never contend for the
+    # Google Sheets write quota, which is per user and shared by every job.
+    - cron: '30 */6 * * *'
+  workflow_dispatch:
+
+env:
+  # Number of matrix slices. MUST match the length of the matrix.batch list below.
+  #
+  # Sized very differently from the EVM side. That upstream blocks at ~10 requests
+  # per IP, which is why it needs 50 jobs for 100 wallets. These two feeds are
+  # public, unauthenticated, and answer immediately — no pending-job polling, so
+  # no wasted requests — and no per-IP quota has been observed. The cost is
+  # therefore just pages: measured on a real wallet, page 1 of transfers covered
+  # 73 days (30 rows) and page 1 of swaps 37 days (50 rows), so a 180-day window
+  # is roughly 3 + 5 pages for a BUSY wallet and 2 for a quiet one.
+  #
+  # 10 jobs x ~10 wallets x ~8 requests = ~80 requests per job, well inside the
+  # per-job budget below. Raise BATCH_TOTAL (and the matrix) if a job starts
+  # hitting that budget — the log prints requests used against it every run.
+  BATCH_TOTAL: '10'
+
+  # One tab for everything, same policy as the EVM side: the SolBatch_NN tabs are
+  # scratch space and the consolidate job folds them in and deletes them.
+  MASTER_SHEET_NAME: ${{ secrets.SOL_MASTER_SHEET_NAME || 'Solana' }}
+
+  # Kept distinct from the EVM prefix ("Batch_"), so neither workflow's
+  # consolidation can ever see — or delete — the other's tabs. The pattern is
+  # anchored, so "Batch_07" and "SolBatch_07" never match each other.
+  BATCH_SHEET_PREFIX: 'SolBatch_'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      # These feeds have no observed per-IP quota, but until one run has proved
+      # that at this volume, keep the jobs sequential like the EVM side.
+      max-parallel: 1
+      matrix:
+        # Length MUST equal BATCH_TOTAL above — change both together.
+        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    name: sol batch ${{ matrix.batch }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Solana sync (batch ${{ matrix.batch }})
+        env:
+          # --- Upstream feeds: kept out of the source, see README ---
+          # The wallet address is appended to each: "<url>/<address>".
+          SOL_TRANSFERS_API_URL: ${{ secrets.SOL_TRANSFERS_API_URL }}
+          SOL_SWAPS_API_URL: ${{ secrets.SOL_SWAPS_API_URL }}
+
+          # --- Wallets: base58, and CASE IS SIGNIFICANT ---
+          # Kept in its own secret rather than mixed into WALLET_LIST: the two
+          # chains have different address formats, feeds, tabs and columns.
+          SOL_WALLET_LIST: ${{ secrets.SOL_WALLET_LIST }}
+
+          # --- Google Sheets ---
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          BATCH_SHEET_PREFIX: ${{ env.BATCH_SHEET_PREFIX }}
+          SHEETS_WRITE_DELAY_MS: '1500'
+          CHUNK_SIZE: '500'
+
+          # --- History window & paging ---
+          HISTORY_DAYS: '180'
+          PAGE_COUNT: '2000'             # row ceiling per wallet per feed
+          MAX_PAGES_PER_WALLET: '20'     # anti-runaway cap
+          PAGE_DELAY_MIN_MS: '800'       # spacing between pages of one feed
+          PAGE_DELAY_MAX_MS: '1500'
+
+          # Cursor parameter names. The transfers feed returns `next` (a unix
+          # timestamp) and this is almost certainly its parameter. The swaps feed
+          # returns `hasMoreData` and NO cursor, so "offset" is a guess — if the
+          # server ignores it the run detects page 2 repeating page 1, stops, and
+          # logs which variable to correct. Find the real one by scrolling the
+          # history in a browser and reading the follow-up request.
+          # SOL_TRANSFERS_CURSOR_PARAM: 'next'
+          # SOL_SWAPS_CURSOR_PARAM: 'offset'
+
+          # --- Request spacing ---
+          # Politeness, not a workaround: nothing here has pushed back so far.
+          JITTER_MIN_MS: '1000'
+          JITTER_MAX_MS: '2500'
+          MAX_DELAY_MS: '30000'
+
+          # Per-job request budget. Far above the EVM side's 8 because there is
+          # no ~10-per-IP wall here; it is an anti-runaway guard, not a quota.
+          MAX_REQUESTS_PER_RUN: '150'
+
+          ROTATION_PERIOD_MS: '3600000'
+
+          # --- Address-poisoning detection (same two signals as the EVM tab) ---
+          SUSPECT_DUST_USD: '0.01'
+          DROP_SUSPECTED: '0'
+
+          LOG_LEVEL: 'INFO'
+          GLOBAL_TIMEOUT_MS: '1200000'
+          WRITE_RESERVE_MS: '90000'
+
+          # --- 429/403 handling (unused so far, kept for the day it is needed) ---
+          RATE_LIMIT_WAIT_MS: '30000'
+          MAX_COOLDOWN_MS: '120000'
+          MAX_BLOCK_RETRIES: '2'
+          WALLET_BLOCK_BUDGET_MS: '120000'
+          CIRCUIT_BREAKER_THRESHOLD: '2'
+          MAX_RETRIES: '10'
+          MAX_TIMEOUT_RETRIES: '5'
+
+          # --- Snapshot policy: identical to the EVM side, and for the same
+          # reason. These two MUST move together. ---
+          FULL_REFRESH: '1'
+          MIN_SUCCESS_RATIO: '1'
+
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          node src/index.js --chain sol --batch ${{ matrix.batch }}/${{ env.BATCH_TOTAL }}
+
+  consolidate:
+    needs: sync
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: consolidate
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Merge SolBatch tabs into one sheet
+        env:
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          MASTER_SHEET_NAME: ${{ env.MASTER_SHEET_NAME }}
+          BATCH_SHEET_PREFIX: ${{ env.BATCH_SHEET_PREFIX }}
+          DELETE_BATCH_TABS: '1'
+          HISTORY_DAYS: '180'
+          CHUNK_SIZE: '500'
+          SHEETS_WRITE_DELAY_MS: '1500'
+          LOG_LEVEL: 'INFO'
+        run: |
+          node src/index.js --chain sol --consolidate
